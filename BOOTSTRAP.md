@@ -34,7 +34,7 @@ $TARGET_DIR/
 │   └── disambiguations/       # 消歧义专页
 ├── Graph/                     # 结构健康层（自动生成，勿手动修改）
 │   ├── README.md
-│   └── reports/               # 图谱审计报告
+│   └── graph-report.md        # 图谱审计报告（build_graph.py --report --save 生成）
 └── Tools/                     # 工具脚本（bootstrap 阶段一次性生成，纳入 git 跟踪）
     └── README.md
 ```
@@ -56,7 +56,7 @@ $TARGET_DIR/
 - [ ] 6. 写入 `.gitignore`
 - [ ] 7. 写入各层 `README.md`
 - [ ] 8. 写入 `Wiki/` 初始核心文件
-- [ ] 8.5 生成并写入全部工具脚本（`health.py` / `lint.py` / `build_graph.py` / `ingest.py` / `pdf2md.py` / `refresh.py`）
+- [ ] 8.5 生成并写入全部工具脚本（`common.py` / `health.py` / `lint.py` / `build_graph.py` / `ingest.py` / `query.py` / `refresh.py`）
 - [ ] 9. 初始化 Git 仓库
 - [ ] 10. 追加 bootstrap 记录到 `log.md`
 - [ ] 11. 首次 Git 提交（含工具脚本）
@@ -69,6 +69,7 @@ $TARGET_DIR/
 1. **Raw 层目录**：使用默认三类目录（`Sources / Thoughts / Records / Assets`），还是自定义？（默认：使用三类默认目录。若自定义，请用户列出目录名及各自的加注类型，后续所有涉及 Raw 子目录的规则均以用户提供的映射为准）
 2. **检索工具**：使用 `qmd`（推荐）还是其他工具？（默认：`qmd`，不可用则降级为纯文本扫描）
 3. **Git 远程**：是否配置 `origin`？若是，提供 URL。（默认：暂不配置）
+4. **归档模式**：查询完成后，是否**询问用户**再决定是否归档综述？（默认：询问。若用户选择"默认自动归档"，则跳过询问步骤，直接归档，可用 `--no-archive` 跳过）
 
 ### 1.2 验证目标目录
 
@@ -86,7 +87,7 @@ ls -la "$TARGET_DIR"
 
 - `Wiki/` 下各子目录**绝对禁止**再建子文件夹
 - `Raw/` 下**仅**预建用户在 §1.1 确认的子目录（默认为 `Sources/`、`Thoughts/`、`Records/`、`Assets/` 四个）
-- `Graph/reports/` 初始为空目录
+- `Graph/` 初始仅预建根目录即可；`graph-report.md` 由脚本运行时自动生成，无需预建
 
 ### 1.4 写入 `AGENTS.md`
 
@@ -95,8 +96,6 @@ ls -la "$TARGET_DIR"
 | 占位符 | 替换为 |
 |--------|--------|
 | `<YYYY-MM-DD>` | 今日日期（ISO 8601） |
-| `<retrieval-tool>` | 用户确认的检索工具名（默认 `qmd`） |
-| `<retrieval-tool-embed>` | 对应的索引更新命令（如 `qmd embed --collection wiki`） |
 | `<raw-dir-table>` | 用户在 §1.1 确认的 Raw 子目录映射表（默认三类） |
 
 ### 1.5 写入 `README.md`
@@ -189,7 +188,7 @@ Thumbs.db
 
 - `graph.json`：节点与边的结构化数据（含语义边类型）
 - `graph.html`：基于 vis.js 的可交互可视化页面
-- `reports/`：图谱健康报告（`build graph --report` 生成）
+- `graph-report.md`：图谱健康报告（`python Tools/build_graph.py --report --save` 生成）
 ```
 
 **`Tools/README.md`**：
@@ -198,6 +197,12 @@ Thumbs.db
 # Tools 层说明
 
 所有工具脚本在 bootstrap 阶段一次性生成并纳入 git 跟踪，后续不再重新生成。
+
+## 核心共享模块
+
+| 脚本 | 说明 |
+|------|------|
+| `common.py` | 路径常量、文件 I/O、wikilink 解析、哈希、LLM 调用等共享工具。所有其他脚本必须从此导入，禁止各自实现重复逻辑。 |
 
 ## Agent 触发类（对话中说触发词即可）
 
@@ -215,12 +220,18 @@ Thumbs.db
 
 | 脚本 | 用途 | LLM 调用 |
 |------|------|---------|
+| `query.py` | 查询 Wiki，可选将答案保存为 `Wiki/syntheses/` 词条 | 是 |
 | `pdf2md.py` | 将 PDF / arXiv 论文转换为 Markdown 并存入 `Raw/Sources/` | 零 |
 | `refresh.py` | 检测原始文件哈希变更并重新摄入对应 Wiki 词条 | 是 |
 
 ### 快速参考
 
 ```bash
+# 查询 Wiki（答案可归档为 synthesis 词条）
+python Tools/query.py "主要概念有哪些？"
+python Tools/query.py "A 与 B 的关系是什么？" --save
+python Tools/query.py "综述 X" --save syntheses/x-overview.md
+
 # PDF / arXiv 转换后摄入
 python Tools/pdf2md.py 2401.12345
 python Tools/pdf2md.py paper.pdf --backend marker
@@ -230,6 +241,7 @@ python Tools/ingest.py Raw/Sources/2401-12345.md
 python Tools/refresh.py              # 只刷新哈希变更项
 python Tools/refresh.py --force      # 强制重新摄入全部
 python Tools/refresh.py --dry-run    # 仅列出待刷新项，不执行
+python Tools/refresh.py --page sources/my-page  # 刷新特定 Wiki 页
 ```
 ```
 
@@ -284,6 +296,15 @@ python Tools/refresh.py --dry-run    # 仅列出待刷新项，不执行
 
 生成以下脚本，规格如下：
 
+**`Tools/common.py`** — 所有脚本的共享工具模块
+
+最低规格（其他所有脚本必须从此导入，禁止重复实现）：
+- **路径常量**：`REPO_ROOT`、`WIKI_DIR`、`RAW_DIR`、`GRAPH_DIR`、`LOG_FILE`、`INDEX_FILE`、`OVERVIEW_FILE`
+- **I/O 工具**：`read_file(path)` / `write_file(path, content)`（原子写入，自动创建父目录）/ `ensure_utf8()` / `init_env()`
+- **内容工具**：`extract_wikilinks(text)` / `all_wiki_pages()` / `append_log(entry)` / `resolve_wikilink(name)` / `load_allowed_raw_dirs()`
+- **哈希工具**：`sha256_short(content)` / `sha256_full(content)`
+- **LLM 调用**：`call_llm(prompt, ...)` — 依次尝试 `opencode` / `claude` CLI；支持 `LLM_BACKEND` 环境变量覆盖；`exit_on_error=False` 时返回占位符而非抛异常
+
 **`Tools/health.py`** — 结构完整性检查，零 LLM 调用
 
 最低规格：
@@ -293,11 +314,11 @@ python Tools/refresh.py --dry-run    # 仅列出待刷新项，不执行
   - 空文件 / 存根页（仅有 frontmatter、无正文）
   - 索引同步（`Wiki/index.md` 条目与磁盘文件一致性）
   - 日志覆盖（有词条页面但 log.md 中缺少对应摄入记录）
-  - 断链检查（`[[双链]]` 指向不存在页面）
+  - 断链检查（`[[双链]]` 指向不存在页面，复用 `common.resolve_wikilink()`）
   - Assets 断链检查（Wiki 词条中引用的图片路径不存在）
-  - Raw 目录合规（`Raw/` 下是否存在预设子目录以外的目录）
+  - Raw 目录合规（`Raw/` 下是否存在预设子目录以外的目录，读取 `common.load_allowed_raw_dirs()`）
   - **哈希一致性检查**：扫描 log.md 中所有 `sha256:` 记录，验证对应文件当前哈希是否匹配；不匹配则输出警告，提示研究者确认是否需要重新摄入
-- `--save` 将报告写入 `Wiki/health-report.md` 并 Git 提交
+- `--save` 将报告写入 `Wiki/health-report.md`
 
 **`Tools/lint.py`** — 内容质量审计，消耗 LLM token
 
@@ -305,31 +326,49 @@ python Tools/refresh.py --dry-run    # 仅列出待刷新项，不执行
 - 入参：`[--save]`
 - 退出码：`0` = 无严重问题，`1` = 发现严重问题
 - 前提：必须在 health 通过后运行
-- 检查项：孤儿页、断链、内容矛盾、过时综述、缺失实体页、稀疏页、加注缺失、知识盲区与主动推荐、slug 冲突检测（相同 slug 对应不同来源文件）
-- 图谱感知检查（需先运行 `build graph`）：枢纽存根、脆桥、孤立社区、冲突边密度、高张力低连接节点
+- 检查项：孤儿页、断链（复用 `common.resolve_wikilink()`）、内容矛盾、过时综述、缺失实体页、稀疏页（出站链接 < 2）、加注缺失、slug 冲突检测（相同 slug 对应不同来源文件）、知识盲区与主动推荐
+- 图谱感知检查（需先运行 `build graph`，读取 `Graph/graph.json`）：枢纽存根、脆桥、孤立社区、冲突边密度、高张力低连接节点
+- LLM 不可用时：将分析上下文 dump 至 `Wiki/_semantic_lint_context.md`，由 Agent 手动完成语义分析
+- 运行后追加日志（复用 `common.append_log()`）
 
 **`Tools/build_graph.py`** — 知识图谱构建
 
 最低规格：
 - 入参：`[--open] [--report] [--save] [--no-infer] [--clean]`
-- Pass 1（默认）：提取显式 `[[双链]]`，零 LLM 调用
-- Pass 2（可选）：设置环境变量 `LLM_MODEL_FAST` 启用语义推断边
-- 输出：`Graph/graph.json` 和 `Graph/graph.html`
+- Pass 1（默认）：提取显式 `[[双链]]` 及 `related:` 字段的语义边类型注释，零 LLM 调用
+- Pass 2（可选）：设置环境变量 `LLM_MODEL_FAST` 启用语义推断边；未设置时静默跳过
+- 输出：`Graph/graph.json` 和 `Graph/graph.html`（vis.js 自包含可视化）
+- `--report --save` 将图谱健康报告保存至 `Graph/graph-report.md`（**不是** `Graph/reports/`）
+- 运行后追加日志（复用 `common.append_log()`）
 
 **`Tools/ingest.py`** — 摄入工作流脚本化入口
 
 最低规格：
-- 入参：`[file_path]`（缺省则扫描全部未摄入文件）
-- 退出码：`0` = 成功，`1` = 部分失败（ERROR 已记录）
+- 入参：`[file_path ...]`（缺省则扫描全部未摄入文件）/ `[--no-convert]` / `[--validate-only]`
+- 退出码：`0` = 成功，`1` = 部分失败（ERROR 已记录至 log.md）
+- 核心逻辑：路径 + SHA-256 双重去重；自动调用 `markitdown` 转换非 Markdown 格式；写入 JSON 化 LLM 响应到各 Wiki 子目录；运行后追加日志（复用 `common.append_log()`）
 - 调用时 Agent 仍需完整执行 §四 的步骤序列，脚本仅作为步骤触发器
+
+**`Tools/query.py`** — Wiki 查询工具
+
+最低规格：
+- 入参：`"<问题>"` / `[--save]` / `[--save <path>]`
+- 退出码：`0` = 成功
+- 核心逻辑：
+  1. 读取 `Wiki/index.md`，用关键词匹配 + CJK 三元组匹配筛选相关页面
+  2. 若 `Graph/graph.json` 存在，对命中页面进行图谱邻居扩展（置信度 ≥ 0.7 的边）
+  3. 若关键词命中不足，调用 LLM 从 index 中二次选页
+  4. 综合命中页面，用 LLM 生成 Markdown 答案（含 `[[wikilink]]` 引用）
+  5. `--save` 或 `--save <path>`：将答案写入 `Wiki/syntheses/<slug>.md`，更新 index，追加日志
 
 **`Tools/pdf2md.py`** — PDF / arXiv 转 Markdown，零 LLM 调用
 
 **`Tools/refresh.py`** — 基于文件哈希检测变更并重新摄入
 
 最低规格：
-- 入参：`[--force] [--dry-run]`
-- 核心逻辑：计算 `Raw/` 下所有已摄入文件的当前 SHA-256，与 log.md 中记录的哈希对比；不一致者加入重摄入队列
+- 入参：`[--force] [--dry-run] [--page <wiki-source-page>]`
+- `--page`：刷新特定 Wiki 源页（如 `--page sources/my-page`），无需扫描全部
+- 核心逻辑：以 `log.md` 中 `sha256:` 字段为权威基准，降级回退本地缓存 `Graph/.refresh_cache.json`；哈希不一致者加入重摄入队列；成功后更新缓存
 
 ### 1.9 初始化 Git 仓库
 
@@ -344,13 +383,13 @@ git add AGENTS.md README.md .gitignore Raw/ Wiki/ Graph/ Tools/
 `Wiki/log.md` 末尾追加（将 `<YYYY-MM-DD>` 替换为当天日期）：
 
 ```
-## [<YYYY-MM-DD>] bootstrap | LLM Wiki OS v4.0 骨架建立
+## [<YYYY-MM-DD>] bootstrap | LLM Wiki OS v4.1 骨架建立
 ```
 
 ### 1.11 首次 Git 提交
 
 ```bash
-git commit -m "chore: bootstrap LLM Wiki OS v4.0"
+git commit -m "chore: bootstrap LLM Wiki OS v4.1"
 ```
 
 若用户在 §1.1 提供了远程仓库 URL：
@@ -408,7 +447,7 @@ git push -u origin main
 | `lint` | 质量审计 | 孤儿页、矛盾、盲区检查（每 10–15 次摄入跑一次） |
 | `build graph` | 图谱分析 | 生成上帝节点、脆桥报告 |
 | `graph report` | 图谱健康报告 | 输出结构分析 |
-| `<retrieval-tool> reindex` | 重建检索索引 | Raw + Wiki 双集合重建 |
+| `qmd reindex` | 重建检索索引 | Raw + Wiki 双集合重建 |
 
 或用自然语言描述，Agent 自行映射到对应工作流。
 
@@ -634,7 +673,7 @@ sha256sum "<文件路径>"
 **3. 检索预扫描**：摄入前，用检索工具定位已有相关内容：
 
 ```bash
-<retrieval-tool> query "<核心概念关键词>" --collection wiki --format files --min-score 0.4
+qmd query "<核心概念关键词>" --collection wiki --format files --min-score 0.4
 ```
 
 - 命中得分 ≥ 0.4 的 Wiki 词条 → 进入增量合并流程（见§五）
@@ -687,7 +726,7 @@ git commit -m "ingest: <标题>"
 **12. 更新检索索引**：
 
 ```bash
-<retrieval-tool> embed --collection wiki
+qmd embed --collection wiki
 ```
 
 **13. 工作流结尾汇总**：输出本次摄入的新建词条列表与 ERROR 记录数量（若有）。
@@ -744,10 +783,10 @@ git commit -m "ingest: <标题>"
 **2. 语义主检索**：
 
 ```bash
-<retrieval-tool> query "<问题关键词>" --collection wiki --format json -n 8
+qmd query "<问题关键词>" --collection wiki --format json -n 8
 ```
 
-读取命中词条，综合答案，使用 `[[词条名]]` 内联引用标注来源。
+读取命中词条，综合答案，使用 `[[词条名]]` 内联引用标注来源。若 qmd 不可用，读取 `Wiki/index.md` 做关键词匹配，并结合 `Graph/graph.json`（若存在）对命中页面进行图谱邻居扩展（置信度 ≥ 0.7 的边）。
 
 **【富格式输出契约】**：根据问题特质主动丰富输出形式：
 - **结构化对比**（多流派 / 配置 / 策略对比）→ 提供 Markdown 对比表格
@@ -757,21 +796,24 @@ git commit -m "ingest: <标题>"
 **3. 盲区回退**：若 Wiki 集合无命中（得分均低于 0.4），降级检索 Raw 集合：
 
 ```bash
-<retrieval-tool> query "<问题关键词>" --collection raw --format json -n 8
+qmd query "<问题关键词>" --collection raw --format json -n 8
 ```
 
 - Raw 命中 → 基于原始笔记作答，末尾附注警告，同时触发生长层次二（见下）
 - Raw 仍无命中 → 告知研究者该主题存在知识盲区，建议补充原始笔记
 
-**【生长层次一：综述自动归档】**：查询完成后，Agent 默认将本次答案归档至 `Wiki/syntheses/<slug>.md`（`--no-archive` 可跳过）。归档后：
+**【生长层次一：综述归档】**：查询完成后，询问研究者是否归档本次答案：
+
+> 📌 是否将本次答案归档为 `Wiki/syntheses/<slug>.md`？（Y/N，或指定路径）
+
+- 若归档模式在 §1.1 中已设置为"默认自动归档"，跳过询问直接执行
+- 归档后执行：
 
 ```bash
 git add Wiki/index.md Wiki/log.md Wiki/syntheses/<slug>.md
 git commit -m "query-synthesis: <问题简写>"
-<retrieval-tool> embed --collection wiki
+qmd embed --collection wiki
 ```
-
-> **为什么改为默认归档**：好的查询答案本身就是知识库的新页面。每次询问用户是否归档会造成摩擦，导致洞见沉没在聊天历史里。默认归档与系统整体"默认自动执行，例外才挂起"的原则一致。研究者若不需要某次归档，用 `--no-archive` 跳过即可。
 
 **【生长层次二：盲区驱动摄入】**：当 Raw 命中时，强制询问：
 > ⚠️ 检测到知识盲区：Wiki 层对「<问题关键词>」覆盖不足，但在 Raw 层发现相关文件：
@@ -812,7 +854,7 @@ git commit -m "query-synthesis: <问题简写>"
 - **Raw 目录合规**：`Raw/` 下是否存在预设子目录以外的其他子目录（提示研究者手动整理）
 - **哈希一致性检查**：扫描 log.md 中所有 `sha256:` 记录，验证对应文件当前哈希是否匹配；不匹配则输出警告，提示研究者确认是否需要重新摄入（文件被修改的场景）
 
-`--save` 参数将报告写入 `Wiki/health-report.md` 并 Git 提交。
+`--save` 参数将报告写入 `Wiki/health-report.md`。若需纳入版本控制，研究者手动 `git add -f Wiki/health-report.md && git commit`。
 
 ---
 
@@ -840,7 +882,7 @@ git commit -m "query-synthesis: <问题简写>"
 - **冲突边密度**：`relation: contradicts` 的边占总边数的比例；密度过高提示知识领域存在系统性争议，建议优先消歧
 - **高张力低连接节点**：持有大量 `contradicts` 关系但整体度数偏低的节点，可能是未被充分研究的核心争议点
 
-输出审计报告，询问用户是否保存至 `Wiki/lint-report.md`。保存后 Git 提交。
+输出审计报告，询问用户是否保存至 `Wiki/lint-report.md`。保存后 Git 提交。运行结束后自动追加日志记录（脚本内部通过 `common.append_log()` 完成，无需 Agent 手动写入）。
 
 ### Health vs Lint 边界
 
@@ -871,13 +913,13 @@ git commit -m "query-synthesis: <问题简写>"
 4. 写入 `Graph/graph.json`：
    ```json
    {
-     "nodes": [{"id": "Wiki/concepts/X.md", "label": "X", "degree": 5}],
+     "nodes": [{"id": "concepts/X", "label": "X", "degree": 5}],
      "edges": [
-       {"source": "Wiki/concepts/A.md", "target": "Wiki/concepts/B.md", "relation": "supports"},
-       {"source": "Wiki/concepts/C.md", "target": "Wiki/concepts/D.md", "relation": "contradicts"}
+       {"from": "concepts/A", "to": "concepts/B", "type": "EXTRACTED", "relation": "supports"},
+       {"from": "concepts/C", "to": "concepts/D", "type": "EXTRACTED", "relation": "contradicts"}
      ],
      "inferred_edges": [
-       {"source": "Wiki/concepts/E.md", "target": "Wiki/concepts/F.md", "confidence": 0.7, "relation": "INFERRED"}
+       {"from": "concepts/E", "to": "concepts/F", "confidence": 0.7, "type": "INFERRED"}
      ],
      "built": "YYYY-MM-DD"
    }
@@ -890,6 +932,8 @@ Git 提交：
 git add Graph/
 git commit -m "graph: rebuild graph data"
 ```
+
+`--report --save` 将图谱健康报告保存至 `Graph/graph-report.md`（**注意**：直接在 `Graph/` 下，不是 `Graph/reports/`）。
 
 **图谱健康报告指标**：
 - **健康摘要**：边/节点比、孤儿占比、社区数量、链接密度
@@ -981,13 +1025,13 @@ git commit -m "graph: rebuild graph data"
 
 ```bash
 # 1. 复制本文件到目标目录
-cp BOOTSTRAP_v4.0.md /path/to/new-vault/
+cp BOOTSTRAP_v4.1.md /path/to/new-vault/
 
 # 2. 切换到目标目录
 cd /path/to/new-vault
 
 # 3. 在 AI 助手（Cursor / Claude Code 等）会话中说：
-#    "请阅读 BOOTSTRAP_v4.0.md 并严格执行其中的 bootstrap 工作流"
+#    "请阅读 BOOTSTRAP_v4.1.md 并严格执行其中的 bootstrap 工作流"
 ```
 
 ---
@@ -1006,4 +1050,4 @@ cd /path/to/new-vault
 5. Lint 加注缺失检查（§八）→ 定期审计加注执行情况
 6. 哈希一致性检查（§七）→ 防止文件静默变更后 Wiki 内容与 Raw 事实脱节
 
-**默认自动执行，例外才挂起**：知识库只有在维护成本足够低时才能长期运转。
+**默认自动执行，例外才挂起**：知识库只有在维护成本足够低时才能长期运转。查询归档是例外：写入 Wiki 的决策由研究者确认，不由 Agent 代劳。
