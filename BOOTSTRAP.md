@@ -35,7 +35,7 @@ $TARGET_DIR/
 ├── Graph/                     # 结构健康层（自动生成，勿手动修改）
 │   ├── README.md
 │   └── reports/               # 图谱审计报告
-└── Tools/                     # 独立工具脚本（首次执行 health/lint 时按需生成）
+└── Tools/                     # 工具脚本（bootstrap 阶段一次性生成，纳入 git 跟踪）
     └── README.md
 ```
 
@@ -56,9 +56,10 @@ $TARGET_DIR/
 - [ ] 6. 写入 `.gitignore`
 - [ ] 7. 写入各层 `README.md`
 - [ ] 8. 写入 `Wiki/` 初始核心文件
+- [ ] 8.5 生成并写入全部工具脚本（`health.py` / `lint.py` / `build_graph.py` / `ingest.py` / `pdf2md.py` / `refresh.py`）
 - [ ] 9. 初始化 Git 仓库
 - [ ] 10. 追加 bootstrap 记录到 `log.md`
-- [ ] 11. 首次 Git 提交
+- [ ] 11. 首次 Git 提交（含工具脚本）
 - [ ] 12. 最终验证与报告
 
 ### 1.1 向用户询问关键配置
@@ -140,6 +141,14 @@ Graph/.refresh_cache.json
 Wiki/_semantic_lint_context.md
 *.tmp
 
+# 工具运行时生成的报告（需用户显式确认保存后才写入，此处仍屏蔽以防误提交）
+Wiki/health-report.md
+Wiki/lint-report.md
+
+# markitdown 转换中间文件
+*.docx.md
+*.pdf.md
+
 # OS 文件
 .DS_Store
 Thumbs.db
@@ -167,7 +176,7 @@ Thumbs.db
 
 - 把文件放入对应子目录后，在 AI 会话中说 `ingest` 即可触发摄入
 - 哪些文件已被摄入，通过 `Wiki/log.md` 追踪，无需自行标记
-- 你可以随时新增、重命名或删除文件，Agent 会在下次会话时感知变化
+- 你可以随时新增文件；若需重命名或移动已摄入文件，请告知 Agent 以更新日志哈希
 - **Agent 严禁修改或移动 Raw/ 内任何文件**
 ```
 
@@ -188,7 +197,7 @@ Thumbs.db
 ```markdown
 # Tools 层说明
 
-工具脚本分两类：Agent 触发类在首次对话触发时自动生成；命令行工具需手动运行。
+所有工具脚本在 bootstrap 阶段一次性生成并纳入 git 跟踪，后续不再重新生成。
 
 ## Agent 触发类（对话中说触发词即可）
 
@@ -207,7 +216,7 @@ Thumbs.db
 | 脚本 | 用途 | LLM 调用 |
 |------|------|---------|
 | `pdf2md.py` | 将 PDF / arXiv 论文转换为 Markdown 并存入 `Raw/Sources/` | 零 |
-| `refresh.py` | 检测原始文件变更并重新摄入对应 Wiki 词条 | 是 |
+| `refresh.py` | 检测原始文件哈希变更并重新摄入对应 Wiki 词条 | 是 |
 
 ### 快速参考
 
@@ -218,7 +227,7 @@ python Tools/pdf2md.py paper.pdf --backend marker
 python Tools/ingest.py Raw/Sources/2401-12345.md
 
 # 检测并刷新已变更的原始文件
-python Tools/refresh.py              # 只刷新变更项
+python Tools/refresh.py              # 只刷新哈希变更项
 python Tools/refresh.py --force      # 强制重新摄入全部
 python Tools/refresh.py --dry-run    # 仅列出待刷新项，不执行
 ```
@@ -265,9 +274,62 @@ python Tools/refresh.py --dry-run    # 仅列出待刷新项，不执行
 ```markdown
 # Wiki 操作日志
 
-<!-- 格式：## [YYYY-MM-DD] <操作> | <标题> -->
+<!-- 格式：## [YYYY-MM-DD] <操作> | <标题> | [[Raw/子目录/路径/文件名]] | sha256:<hash> -->
 <!-- 操作类型：bootstrap / ingest / query / query-synthesis / health / lint / graph / chore / ERROR -->
 ```
+
+### 1.8.5 生成并写入全部工具脚本
+
+> **重要**：工具脚本在 bootstrap 阶段**一次性生成**，纳入 git 跟踪后后续不再重新生成。这确保每个 Agent 实例使用行为一致的脚本，避免检查结果漂移。
+
+生成以下脚本，规格如下：
+
+**`Tools/health.py`** — 结构完整性检查，零 LLM 调用
+
+最低规格：
+- 入参：`[--json] [--save]`
+- 退出码：`0` = 全部通过，`1` = 发现问题
+- 检查项：
+  - 空文件 / 存根页（仅有 frontmatter、无正文）
+  - 索引同步（`Wiki/index.md` 条目与磁盘文件一致性）
+  - 日志覆盖（有词条页面但 log.md 中缺少对应摄入记录）
+  - 断链检查（`[[双链]]` 指向不存在页面）
+  - Assets 断链检查（Wiki 词条中引用的图片路径不存在）
+  - Raw 目录合规（`Raw/` 下是否存在预设子目录以外的目录）
+  - **哈希一致性检查**：扫描 log.md 中所有 `sha256:` 记录，验证对应文件当前哈希是否匹配；不匹配则输出警告，提示研究者确认是否需要重新摄入
+- `--save` 将报告写入 `Wiki/health-report.md` 并 Git 提交
+
+**`Tools/lint.py`** — 内容质量审计，消耗 LLM token
+
+最低规格：
+- 入参：`[--save]`
+- 退出码：`0` = 无严重问题，`1` = 发现严重问题
+- 前提：必须在 health 通过后运行
+- 检查项：孤儿页、断链、内容矛盾、过时综述、缺失实体页、稀疏页、加注缺失、知识盲区与主动推荐、slug 冲突检测（相同 slug 对应不同来源文件）
+- 图谱感知检查（需先运行 `build graph`）：枢纽存根、脆桥、孤立社区、冲突边密度、高张力低连接节点
+
+**`Tools/build_graph.py`** — 知识图谱构建
+
+最低规格：
+- 入参：`[--open] [--report] [--save] [--no-infer] [--clean]`
+- Pass 1（默认）：提取显式 `[[双链]]`，零 LLM 调用
+- Pass 2（可选）：设置环境变量 `LLM_MODEL_FAST` 启用语义推断边
+- 输出：`Graph/graph.json` 和 `Graph/graph.html`
+
+**`Tools/ingest.py`** — 摄入工作流脚本化入口
+
+最低规格：
+- 入参：`[file_path]`（缺省则扫描全部未摄入文件）
+- 退出码：`0` = 成功，`1` = 部分失败（ERROR 已记录）
+- 调用时 Agent 仍需完整执行 §四 的步骤序列，脚本仅作为步骤触发器
+
+**`Tools/pdf2md.py`** — PDF / arXiv 转 Markdown，零 LLM 调用
+
+**`Tools/refresh.py`** — 基于文件哈希检测变更并重新摄入
+
+最低规格：
+- 入参：`[--force] [--dry-run]`
+- 核心逻辑：计算 `Raw/` 下所有已摄入文件的当前 SHA-256，与 log.md 中记录的哈希对比；不一致者加入重摄入队列
 
 ### 1.9 初始化 Git 仓库
 
@@ -282,13 +344,13 @@ git add AGENTS.md README.md .gitignore Raw/ Wiki/ Graph/ Tools/
 `Wiki/log.md` 末尾追加（将 `<YYYY-MM-DD>` 替换为当天日期）：
 
 ```
-## [<YYYY-MM-DD>] bootstrap | LLM Wiki OS v3.5 骨架建立
+## [<YYYY-MM-DD>] bootstrap | LLM Wiki OS v4.0 骨架建立
 ```
 
 ### 1.11 首次 Git 提交
 
 ```bash
-git commit -m "chore: bootstrap LLM Wiki OS v3.5"
+git commit -m "chore: bootstrap LLM Wiki OS v4.0"
 ```
 
 若用户在 §1.1 提供了远程仓库 URL：
@@ -324,7 +386,7 @@ git push -u origin main
 ## 会话启动规程（每次新会话必须首先执行）
 
 ```
-1. 运行 health 检查（见§七）
+1. 运行 health 检查（直接执行 python Tools/health.py，见§七）
 2. 读取 Wiki/log.md 最近 10 条记录，了解上次会话的操作上下文
 3. 读取 Wiki/index.md，获取当前知识库词条全貌
 4. 报告：健康状态摘要 + 上次会话摘要 + 当前词条数
@@ -433,7 +495,7 @@ pending_review: false
 （150 字以内，精准的本质定义，严禁前言后语）
 
 ## 🎯 核心论点与逻辑演进
-（无序列表 `-` 结构化呈现。加注规则见§二：据文献 / 个人思考 / 个人经验 / 据查询合成）
+（无序列表 `-` 结构化呈现。加注规则：据文献 / 个人思考 / 个人经验 / 据查询合成）
 
 ## ⚖️ 边界防御与相近概念区分
 * 对比 **[[Wiki/concepts/相近概念X.md]]**：指出本质区别，严禁语义串味。
@@ -540,7 +602,16 @@ last_updated: YYYY-MM-DD
 
 **触发**：`ingest` 或 `ingest <file>`
 
-**【裸摄入默认行为】**：当用户发出 `ingest` 指令但未指定具体文件时，默认处理 `Raw/Sources/`、`Raw/Thoughts/`、`Raw/Records/` 下所有尚未被摄入的文件（`Raw/Assets/` 跳过）。判断依据：扫描 `Wiki/log.md`，凡日志中已有对应双链记录的文件视为已处理，其余均列入待摄入队列。Agent 应先给出待摄入清单（标注每个文件所在子目录及对应加注类型），然后直接批量触发摄入工作流（无需逐一确认，除非触发冲突或消歧）。
+**【裸摄入默认行为】**：当用户发出 `ingest` 指令但未指定具体文件时，默认处理 `Raw/Sources/`、`Raw/Thoughts/`、`Raw/Records/` 下所有尚未被摄入的文件（`Raw/Assets/` 跳过）。
+
+**【去重判断依据】**：扫描 `Wiki/log.md`，以文件路径与 SHA-256 哈希双重匹配作为去重主键。具体规则：
+- 路径存在于 log.md 且当前文件哈希与 log.md 中记录的哈希一致 → 已摄入，跳过
+- 路径存在于 log.md 但当前哈希不匹配 → 文件已被修改，输出警告，询问是否重新摄入
+- 路径不在 log.md → 未摄入，加入队列
+
+> **为什么用哈希而非仅用路径**：文件重命名或移动后，旧路径双链失效，纯路径匹配会导致同一内容被重复摄入；哈希匹配在路径变更后仍能正确识别已处理文件。
+
+Agent 应先给出待摄入清单（标注每个文件所在子目录及对应加注类型），然后直接批量触发摄入工作流（无需逐一确认，除非触发冲突或消歧）。
 
 **前提原则**：凡研究者放入 `Raw/` 的文件，均视为已确认需要摄入，Agent 不做二次价值判断。
 
@@ -552,7 +623,15 @@ last_updated: YYYY-MM-DD
 
 **1. 确定加注类型**：读取文件路径，根据 §二 的目录映射表确定本文件的加注类型（`据文献` / `个人思考` / `个人经验`）。此步骤无需检索，直接由路径决定。
 
-**2. 检索预扫描**：摄入前，用检索工具定位已有相关内容：
+**2. 计算文件哈希**：
+
+```bash
+sha256sum "<文件路径>"
+```
+
+记录哈希值，用于步骤 9 的日志写入与后续去重校验。
+
+**3. 检索预扫描**：摄入前，用检索工具定位已有相关内容：
 
 ```bash
 <retrieval-tool> query "<核心概念关键词>" --collection wiki --format files --min-score 0.4
@@ -561,13 +640,17 @@ last_updated: YYYY-MM-DD
 - 命中得分 ≥ 0.4 的 Wiki 词条 → 进入增量合并流程（见§五）
 - 无命中 → 进入新建词条流程
 
-**3. 读取源文件**：完整读取（非 Markdown 先自动转换）。含图片的 Markdown 文件按 §二【Assets 定位与图片读取规则】步骤处理。
+**4. 读取源文件**：完整读取（非 Markdown 先自动转换）。含图片的 Markdown 文件按 §二【Assets 定位与图片读取规则】步骤处理。
 
-**4. 读取 Wiki 上下文**：读取 `Wiki/index.md` 和 `Wiki/overview.md` 获取当前全貌。
+**5. 读取 Wiki 上下文**：读取 `Wiki/index.md` 和 `Wiki/overview.md` 获取当前全貌。
 
-**5. 执行摄入**：默认全自动执行，仅以下两类情况挂起：
+**6. 执行摄入**：默认全自动执行，仅以下情况挂起：
 
-**情况 A — 检测到冲突信号**（见§五 5.2 冲突定义），挂起并呈现冲突详情。
+**情况 A — 检测到冲突信号**，挂起并呈现冲突详情。冲突判断标准（无需跳转其他章节，直接按此执行）：
+- 新料与现有词条对同一命题给出相反断言 → 挂起
+- 数值、年份、因果方向明确不一致 → 挂起
+- 同一词汇在新料与已有词条中指向完全不同的对象 → 挂起
+- 其余情况默认自动合并，不挂起
 
 **情况 B — 技术性失败**，写入 ERROR 日志，跳过该文件继续处理队列：
 - 文件损坏或编码异常，Agent 无法读取内容
@@ -575,36 +658,39 @@ last_updated: YYYY-MM-DD
 
 > **新建词条无需确认**：直接写入，工作流结尾输出"本次新建词条汇总"供研究者复盘。
 
-**6. 新建或增量合并词条**（见§五）：在 `Wiki/` 对应子目录下创建或更新词条，严格执行 §二 加注规则。
+**7. 新建或增量合并词条**：在 `Wiki/` 对应子目录下创建或更新词条，严格执行 §二 加注规则。
 
-**7. 更新索引与综述**：
+**8. 更新索引与综述**：
 - 更新 `Wiki/index.md`，在对应分类下添加条目
 - 若本次摄入产生了跨领域新联系或修正了已有综述判断，更新 `Wiki/overview.md`
 
-**8. 摄入后验证**：检查新词条中所有 `[[双链]]` 是否指向已存在页面；若存在断链，输出警告并记录。
+**9. 摄入后验证**：检查新词条中所有 `[[双链]]` 是否指向已存在页面；若存在断链，输出警告并记录。
 
-**9. 追加日志**（这是判断文件已摄入的唯一依据）：
+**10. 追加日志**（哈希与路径双重记录，是判断文件已摄入的唯一依据）：
 
 ```
-## [YYYY-MM-DD] ingest | <标题> | [[Raw/<子目录>/<路径>/<文件名>]]
+## [YYYY-MM-DD] ingest | <标题> | [[Raw/<子目录>/<路径>/<文件名>]] | sha256:<hash> | slug:<生成的文件名>
 ```
 
-日志条目中必须包含指向原文的双链，以便后续 health 检查和裸摄入扫描正确识别已处理文件。
+日志条目必须同时包含：
+- 指向原文的双链（用于 Obsidian 图谱织网）
+- SHA-256 哈希（用于文件变更检测）
+- 生成的 Wiki 文件名 slug（用于 lint.py 的 slug 冲突检测）
 
-**10. Git 提交**（严禁 `git add Raw/`，Raw/ 由研究者自行管理）：
+**11. Git 提交**（严禁 `git add Raw/`，Raw/ 由研究者自行管理）：
 
 ```bash
 git add Wiki/
 git commit -m "ingest: <标题>"
 ```
 
-**11. 更新检索索引**：
+**12. 更新检索索引**：
 
 ```bash
 <retrieval-tool> embed --collection wiki
 ```
 
-**12. 工作流结尾汇总**：输出本次摄入的新建词条列表与 ERROR 记录数量（若有）。
+**13. 工作流结尾汇总**：输出本次摄入的新建词条列表与 ERROR 记录数量（若有）。
 
 ---
 
@@ -618,7 +704,7 @@ git commit -m "ingest: <标题>"
 
 ### 5.2 冲突处理协议
 
-**【冲突权威定义】**：以下任一情况视为冲突，禁止 Agent 自行裁判，强制挂起：
+**【冲突权威定义】**：以下任一情况视为冲突，禁止 Agent 自行裁判，强制挂起（判断标准已在 §四 步骤 6 内联，此处为规范性定义）：
 - 核心定义段出现直接否定关系（新料与已有词条对同一命题给出相反断言）
 - 数值、年份、因果方向明确不一致
 - 同一词汇在新料与已有词条中指向完全不同的对象
@@ -677,13 +763,15 @@ git commit -m "ingest: <标题>"
 - Raw 命中 → 基于原始笔记作答，末尾附注警告，同时触发生长层次二（见下）
 - Raw 仍无命中 → 告知研究者该主题存在知识盲区，建议补充原始笔记
 
-**【生长层次一：综述归档】**：询问用户是否将本次查询答案归档至 `Wiki/syntheses/<slug>.md`。归档后：
+**【生长层次一：综述自动归档】**：查询完成后，Agent 默认将本次答案归档至 `Wiki/syntheses/<slug>.md`（`--no-archive` 可跳过）。归档后：
 
 ```bash
 git add Wiki/index.md Wiki/log.md Wiki/syntheses/<slug>.md
 git commit -m "query-synthesis: <问题简写>"
 <retrieval-tool> embed --collection wiki
 ```
+
+> **为什么改为默认归档**：好的查询答案本身就是知识库的新页面。每次询问用户是否归档会造成摩擦，导致洞见沉没在聊天历史里。默认归档与系统整体"默认自动执行，例外才挂起"的原则一致。研究者若不需要某次归档，用 `--no-archive` 跳过即可。
 
 **【生长层次二：盲区驱动摄入】**：当 Raw 命中时，强制询问：
 > ⚠️ 检测到知识盲区：Wiki 层对「<问题关键词>」覆盖不足，但在 Raw 层发现相关文件：
@@ -692,11 +780,7 @@ git commit -m "query-synthesis: <问题简写>"
 
 用户确认后，直接触发摄入工作流（§四）。
 
-**【生长层次三：跨词条合成回哺】**：当同时满足以下两个客观条件时，自动提示归档选项：
-- 答案综合了 **3 个及以上**不同 Wiki 词条
-- 答案包含原有词条中**未曾出现**的跨概念推论或对比洞见
-
-提示用户确认后执行：
+**【生长层次三：跨词条合成回哺】**：当答案综合了 **3 个及以上**不同 Wiki 词条时，自动提示归档选项（须用户显式确认后执行）：
 - 将跨词条洞见以 `（据查询合成）` 加注，缝合进相关词条的 `🎯 核心论点` 章节
 - 在这些词条的 `related` 字段中补入新发现的关联词条双链（可酌情加语义边类型注释）
 - 更新 `last_updated` 为当日日期
@@ -717,9 +801,7 @@ git commit -m "query-synthesis: <问题简写>"
 
 **触发**：`health` | **频率**：每次会话启动规程中必跑 | **成本**：零 LLM 调用
 
-若 `Tools/health.py` 尚不存在，Agent 在首次执行 `health` 时根据以下规格自动生成该脚本，然后运行。
-
-运行：`python Tools/health.py [--json] [--save]`
+直接运行（脚本在 bootstrap 阶段已生成）：`python Tools/health.py [--json] [--save]`
 
 **检查项**：
 - **空文件 / 存根页**：仅有 frontmatter、无正文内容的页面
@@ -728,6 +810,7 @@ git commit -m "query-synthesis: <问题简写>"
 - **断链检查**：`[[双链]]` 指向不存在页面的情况
 - **Assets 断链检查**：Wiki 词条中 `![[Raw/Assets/...]]` 引用的图片路径在磁盘上不存在的情况（方向为 Wiki→Assets，不反向追踪孤立附件）
 - **Raw 目录合规**：`Raw/` 下是否存在预设子目录以外的其他子目录（提示研究者手动整理）
+- **哈希一致性检查**：扫描 log.md 中所有 `sha256:` 记录，验证对应文件当前哈希是否匹配；不匹配则输出警告，提示研究者确认是否需要重新摄入（文件被修改的场景）
 
 `--save` 参数将报告写入 `Wiki/health-report.md` 并 Git 提交。
 
@@ -737,9 +820,7 @@ git commit -m "query-synthesis: <问题简写>"
 
 **触发**：`lint` | **频率**：每 10–15 次摄入后执行一次 | **前提**：必须在 health 通过后运行
 
-若 `Tools/lint.py` 尚不存在，Agent 在首次执行 `lint` 时根据以下规格自动生成该脚本，然后运行。
-
-运行：`python Tools/lint.py [--save]`
+直接运行（脚本在 bootstrap 阶段已生成）：`python Tools/lint.py [--save]`
 
 **检查项**：
 - **孤儿页**：无任何入站 `[[链接]]` 的 Wiki 页面
@@ -749,6 +830,7 @@ git commit -m "query-synthesis: <问题简写>"
 - **缺失实体页**：在 3 个及以上页面中被提及但没有独立词条的实体
 - **稀疏页**：出站 `[[双链]]` 少于 2 条的页面
 - **加注缺失**：词条正文中来自 `Sources/` 的内容未加 `（据文献）`，来自 `Thoughts/` 的内容未加 `（个人思考）`，来自 `Records/` 的内容未加 `（个人经验）`
+- **slug 冲突检测**：扫描 log.md 中所有 `slug:` 记录，检查是否存在相同 slug 对应不同来源文件的情况；发现冲突则输出警告，列出冲突的文件路径与 slug，等待研究者手动重命名
 - **知识盲区与主动推荐**：识别 Wiki 无法回答的常见问题类型，建议补充原始笔记；同时根据当前图谱结构（高密度节点周边的稀疏区域、孤立社区边缘）推荐下一步值得深入研究的方向
 
 图谱感知检查（需先运行 `build graph`）：
@@ -768,7 +850,7 @@ git commit -m "query-synthesis: <问题简写>"
 | LLM 调用 | 零 | 是 |
 | 成本 | 免费 | 消耗 token |
 | 频率 | 每次会话，优先运行 | 每 10–15 次摄入 |
-| 检查项 | 空文件、索引同步、日志同步、断链、Assets 断链、Raw 目录合规 | 孤儿、矛盾、知识盲区、缺失实体、加注缺失、知识推荐、图谱张力 |
+| 检查项 | 空文件、索引同步、日志同步、断链、Assets 断链、Raw 目录合规、哈希一致性 | 孤儿、矛盾、知识盲区、缺失实体、加注缺失、slug 冲突、知识推荐、图谱张力 |
 
 ---
 
@@ -776,9 +858,7 @@ git commit -m "query-synthesis: <问题简写>"
 
 **触发**：`build graph`
 
-若 `Tools/build_graph.py` 尚不存在，Agent 在首次执行 `build graph` 时根据以下规格自动生成该脚本，然后运行。
-
-运行：`python Tools/build_graph.py [--open] [--report] [--save] [--no-infer] [--clean]`
+直接运行（脚本在 bootstrap 阶段已生成）：`python Tools/build_graph.py [--open] [--report] [--save] [--no-infer] [--clean]`
 
 **LLM 调用说明**：`build_graph.py` 分两个 Pass 执行：
 - **Pass 1（默认）**：扫描所有 Wiki 页面，提取显式 `[[双链]]` 构建基础图谱，**零 LLM 调用**
@@ -838,6 +918,8 @@ git commit -m "graph: rebuild graph data"
 
 **【kebab-case 中文文件名规则】**：`Wiki/sources/` 和 `Wiki/syntheses/` 的文件名须为简短英文语义词组（2–4个词，kebab-case），严禁使用汉语拼音，严禁保留中文字符。中文源文件须先翻译为英文语义词组再生成文件名。示例：《人性论》→ `treatise-human-nature.md`；《非备兑期权平仓规则》→ `naked-option-exit-rules.md`。
 
+**【slug 一致性原则】**：同一来源文件在不同会话中必须生成相同的 slug。生成 slug 后立即记录至 log.md 的 `slug:` 字段。若 lint 检测到 slug 冲突（相同 slug 对应不同来源文件），输出警告，等待研究者手动确认重命名，不自动覆盖。
+
 **`index.md` 格式**：
 
 ```markdown
@@ -864,7 +946,8 @@ git commit -m "graph: rebuild graph data"
 
 **`log.md` 格式**：
 
-- **正常记录**：`## [YYYY-MM-DD] <操作> | <标题>`
+- **正常摄入记录**：`## [YYYY-MM-DD] ingest | <标题> | [[Raw/<子目录>/<路径>/<文件名>]] | sha256:<hash> | slug:<slug>`
+- **其他正常记录**：`## [YYYY-MM-DD] <操作> | <标题>`
 - **失败记录**：`## [YYYY-MM-DD] ERROR | <操作> | <原因>`
 
 操作类型：`bootstrap` / `ingest` / `query` / `query-synthesis` / `health` / `lint` / `graph` / `chore` / `ERROR`
@@ -887,6 +970,8 @@ git commit -m "graph: rebuild graph data"
 | 工具中间输出 | `Tools/__pycache__/`、`*.pyc` | `.gitignore` 屏蔽 |
 | 检索索引目录 | `.qmd/` | `.gitignore` 屏蔽 |
 | Obsidian 配置 | `.obsidian/`、`workspace.json` | `.gitignore` 屏蔽 |
+| markitdown 中间文件 | `*.docx.md`、`*.pdf.md` | `.gitignore` 屏蔽 |
+| 工具运行报告 | `Wiki/health-report.md`、`Wiki/lint-report.md` | `.gitignore` 屏蔽（用户确认保存后手动 `git add -f`） |
 
 **执行纪律**：Agent 在执行 `git add` 前，必须先清理工作目录中的临时文件。
 
@@ -896,29 +981,45 @@ git commit -m "graph: rebuild graph data"
 
 ```bash
 # 1. 复制本文件到目标目录
-cp BOOTSTRAP_v3.5.md /path/to/new-vault/
+cp BOOTSTRAP_v4.0.md /path/to/new-vault/
 
 # 2. 切换到目标目录
 cd /path/to/new-vault
 
 # 3. 在 AI 助手（Cursor / Claude Code 等）会话中说：
-#    "请阅读 BOOTSTRAP_v3.5.md 并严格执行其中的 bootstrap 工作流"
+#    "请阅读 BOOTSTRAP_v4.0.md 并严格执行其中的 bootstrap 工作流"
 ```
 
 ---
 
-## 4. 设计哲学
+## 4. 设计哲学（Why v4.0）
 
 这套系统的本质是**隔离与编译**，加上**最小摩擦**。
 
 人与 Agent 的分工是这个系统能长期运转的根本：人掌管 Raw 层（策源、策略、目录结构），Agent 掌管 Wiki 层（整理、交叉引用、维护一致性）。这个边界不可模糊——Agent 不干涉 Raw 层的任何决策，包括文件组织方式；人不需要亲自做 Wiki 层的维护工作。
 
-**反幻觉的五个机制**（均集中于 §二，不重复散布）：
+**v4.0 相对 v3.5 的核心修正**：
+
+1. **哈希去重（P0）**：摄入去重从"路径唯一"升级为"路径 + SHA-256 哈希双重匹配"。文件重命名或移动后，旧路径双链失效，纯路径匹配会导致重复摄入或漏摄入；哈希匹配在路径变更后仍能正确识别已处理内容。log.md 新增 `sha256:` 字段，health.py 新增哈希一致性检查，refresh.py 基于哈希变更触发重摄入。
+
+2. **工具脚本 bootstrap 一次性生成（P0）**：原设计中 health/lint/build_graph 脚本"首次触发时懒加载"，导致每个新 Agent 实例可能生成行为不一致的脚本，检查结果不可复现。v4.0 将工具脚本生成提升至 §1.8.5，作为 bootstrap 必须步骤，脚本纳入 git 跟踪，后续不再重新生成。
+
+3. **冲突判断内联（P1）**：冲突处理协议的三条判断标准直接内联到 §四 步骤 6，消除跨节引用（"见§五 5.2"）在 context 截断时被 Agent 静默忽略的风险。§五 保留规范性定义，两者互不矛盾。
+
+4. **生长层次三触发条件简化（P1）**：原条件二"答案包含原有词条中未曾出现的跨概念推论"无法由 Agent 客观判断，实为主观裁量，违反系统"Agent 不做主观判断"原则。v4.0 删除该条件，仅保留可量化的"≥3 个词条"标准，同时明确回哺须用户显式确认。
+
+5. **综述归档默认执行（P3）**：查询完成后默认归档综述（`--no-archive` 跳过），与系统整体"默认自动执行，例外才挂起"原则一致，减少摩擦，防止洞见沉没在聊天历史。
+
+6. **slug 一致性机制（P2）**：log.md 新增 `slug:` 字段，lint.py 新增 slug 冲突检测，防止同一来源在不同会话中生成不同文件名导致索引重复或断链。
+
+7. **`.gitignore` 补全（P2）**：新增 `Wiki/health-report.md`、`Wiki/lint-report.md`、`*.docx.md`、`*.pdf.md`，防止工具运行产物污染 git 状态，干扰后续 `git add` 操作。
+
+**反幻觉的六个机制**：
 1. 目录决定加注类型 → 消除 Agent 对归属的主观猜测
-2. 冲突处理协议（§五 5.2）→ 矛盾不掩盖，挂起等待人工裁决
+2. 冲突处理协议（内联于§四，规范于§五）→ 矛盾不掩盖，挂起等待人工裁决
 3. 禁止自我引用（§二）→ 防止 AI 把自己的总结当事实循环论证
 4. 查询合成加注（§六）→ 跨词条推论永远可追溯
 5. Lint 加注缺失检查（§八）→ 定期审计加注执行情况
+6. 哈希一致性检查（§七）→ 防止文件静默变更后 Wiki 内容与 Raw 事实脱节
 
 **默认自动执行，例外才挂起**：知识库只有在维护成本足够低时才能长期运转。
-
