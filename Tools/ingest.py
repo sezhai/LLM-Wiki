@@ -1,0 +1,615 @@
+#!/usr/bin/env python3
+"""
+Ingest a source document into the LLM Wiki.
+
+Usage:
+    python tools/ingest.py <path-to-source>
+    python tools/ingest.py raw/articles/my-article.md
+    python tools/ingest.py report.pdf                  # auto-converts to .md
+    python tools/ingest.py slides.pptx notes.docx       # batch, mixed formats
+    python tools/ingest.py raw/mixed/ --no-convert      # skip auto-conversion
+    python tools/ingest.py --validate-only              # run validation only
+
+Supported formats (auto-converted via markitdown):
+    .pdf .docx .pptx .xlsx .html .htm .txt .csv .json .xml
+    .rst .rtf .epub .ipynb .yaml .yml .tsv .wav .mp3
+
+The LLM reads the source, extracts knowledge, and updates the wiki:
+  - Creates wiki/sources/<slug>.md
+  - Updates wiki/index.md
+  - Updates wiki/overview.md (if warranted)
+  - Creates/updates entity and concept pages
+  - Appends to wiki/log.md
+  - Flags contradictions
+  - Runs post-ingest validation (broken links, index coverage)
+"""
+
+import os
+import sys
+import json
+import re
+import shutil
+import tempfile
+from pathlib import Path
+from collections import defaultdict
+from datetime import date
+
+from common import (
+    REPO_ROOT, WIKI_DIR, RAW_DIR, LOG_FILE, INDEX_FILE, OVERVIEW_FILE,
+    read_file, write_file, call_llm, sha256_short as sha256,
+    extract_wikilinks, all_wiki_pages, append_log, ensure_utf8, init_env,
+    load_allowed_raw_dirs,
+)
+
+# File extensions that can be auto-converted to markdown via markitdown.
+# .md files are ingested directly without conversion.
+CONVERTIBLE_EXTENSIONS = {
+    ".pdf", ".docx", ".pptx", ".xlsx", ".xls",
+    ".html", ".htm", ".txt", ".csv", ".json", ".xml",
+    ".rst", ".rtf", ".epub", ".ipynb",
+    ".yaml", ".yml", ".tsv",
+    ".wav", ".mp3",  # audio transcription via markitdown
+}
+ALL_SUPPORTED_EXTENSIONS = {".md"} | CONVERTIBLE_EXTENSIONS
+SCHEMA_FILE = REPO_ROOT / "AGENTS.md"
+
+
+def _write_error_log(detail: str) -> None:
+    """Write an ERROR entry to wiki/log.md without raising."""
+    today = date.today().isoformat()
+    try:
+        append_log(f"## [{today}] ERROR | {detail}")
+    except Exception:
+        pass  # log failure must never crash the caller
+
+
+def is_already_ingested(source: Path) -> bool:
+    """Return True if this file has already been ingested (path + sha256 match in log.md).
+
+    Implements the v4.0 dual-key deduplication: a file is considered ingested only
+    when BOTH its current path AND its current sha256 hash appear in the same log entry.
+    If the path is found but the hash differs, the file has been modified and should be
+    re-ingested (caller decides — this function returns False in that case).
+    """
+    log_content = read_file(LOG_FILE)
+    if not log_content:
+        return False
+
+    try:
+        raw_rel = source.resolve().relative_to(REPO_ROOT.resolve()).as_posix()
+    except ValueError:
+        raw_rel = source.name
+
+    from common import sha256_full
+    current_hash_full = sha256_full(source.read_text(encoding="utf-8", errors="replace"))
+    current_hash_short = current_hash_full[:8]  # sha256_short uses first 8 chars
+
+    # Each log entry is separated by double newlines; scan line by line for the path
+    for line in log_content.splitlines():
+        if raw_rel not in line and source.name not in line:
+            continue
+        # Path found — now check whether the sha256 in this line matches
+        m = re.search(r'sha256:([0-9a-f]+)', line)
+        if m:
+            recorded = m.group(1)
+            # Accept both short (8-char) and full (64-char) hashes
+            if recorded == current_hash_short or recorded == current_hash_full:
+                return True
+            else:
+                print(f"  ℹ️  {source.name} found in log but hash changed "
+                      f"(recorded: {recorded[:8]}… current: {current_hash_short}) — will re-ingest")
+                return False
+    return False
+
+
+def ingest_pending(raw_dirs: list[Path] | None = None, auto_convert: bool = True) -> tuple[int, int]:
+    """Scan Raw/ for uningest­ed files and ingest them in batch.
+
+    Scans all allowed Raw/ subdirectories (read from Tools/.raw_dirs via
+    common.load_allowed_raw_dirs()) for all supported files, skips already-
+    ingested ones (path+sha256 dual-key check), and processes the rest.
+
+    Returns (success_count, error_count).
+    """
+    if raw_dirs is None:
+        raw_dirs = [
+            RAW_DIR / name.capitalize()
+            for name in load_allowed_raw_dirs()
+            if name.lower() != "assets"  # Assets holds media, not ingestible sources
+        ]
+
+    pending: list[Path] = []
+    for d in raw_dirs:
+        if not d.exists():
+            continue
+        for f in sorted(d.rglob("*")):
+            if f.is_file() and f.suffix.lower() in ALL_SUPPORTED_EXTENSIONS:
+                pending.append(f)
+
+    # Deduplicate by resolved path
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for p in pending:
+        rp = p.resolve()
+        if rp not in seen:
+            seen.add(rp)
+            unique.append(p)
+
+    if not unique:
+        print("No supported files found in Raw/ directories.")
+        return 0, 0
+
+    # Split into already-done vs pending
+    to_ingest: list[Path] = []
+    skipped = 0
+    for f in unique:
+        if is_already_ingested(f):
+            skipped += 1
+        else:
+            to_ingest.append(f)
+
+    print(f"Raw/ scan: {len(unique)} files found, {skipped} already ingested, "
+          f"{len(to_ingest)} pending.")
+
+    if not to_ingest:
+        print("Nothing to ingest.")
+        return 0, 0
+
+    success = 0
+    errors = 0
+    for f in to_ingest:
+        ok = ingest(str(f), auto_convert=auto_convert)
+        if ok:
+            success += 1
+        else:
+            errors += 1
+
+    print(f"\nBatch complete: {success} ingested, {errors} failed.")
+    if errors:
+        print(f"  ⚠️  {errors} ERROR(s) recorded in Wiki/log.md")
+    return success, errors
+
+
+def clip(text: str, limit: int = 260) -> str:
+    """Truncate text at word boundary instead of mid-word."""
+    if len(text) <= limit:
+        return text
+    clipped = text[: limit - 3].rsplit(" ", 1)[0].rstrip()
+    return clipped + "..."
+
+
+def build_wiki_context() -> str:
+    parts = []
+    if INDEX_FILE.exists():
+        parts.append(f"## wiki/index.md\n{read_file(INDEX_FILE)}")
+    if OVERVIEW_FILE.exists():
+        parts.append(f"## wiki/overview.md\n{read_file(OVERVIEW_FILE)}")
+    # Include recent source pages for contradiction checking
+    sources_dir = WIKI_DIR / "sources"
+    if sources_dir.exists():
+        recent = sorted(sources_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)[:5]
+        for p in recent:
+            parts.append(f"## {p.relative_to(REPO_ROOT)}\n{p.read_text()}")
+    # Include titles of all existing concept and entity pages to prevent duplicate creation
+    existing_titles = []
+    for subdir in ("concepts", "entities"):
+        d = WIKI_DIR / subdir
+        if d.exists():
+            for p in sorted(d.glob("*.md")):
+                content = read_file(p)
+                title_match = re.search(r'^title:\s*["\']?(.+?)["\']?\s*$', content, re.MULTILINE)
+                title = title_match.group(1).strip() if title_match else p.stem
+                existing_titles.append(f"  - [{subdir}/{p.name}] {title}")
+    if existing_titles:
+        parts.append("## Existing concepts & entities (do NOT create duplicates)\n" + "\n".join(existing_titles))
+    return "\n\n---\n\n".join(parts)
+
+
+def parse_json_from_response(text: str) -> dict:
+    # Strip markdown code fences if present
+    text = re.sub(r"^```(?:json)?\s*", "", text.strip())
+    text = re.sub(r"\s*```$", "", text.strip())
+    # Find the outermost JSON object
+    match = re.search(r"\{[\s\S]*\}", text)
+    if not match:
+        raise ValueError("No JSON object found in response")
+    return json.loads(match.group())
+
+
+def update_index(new_entry: str, section: str = "Sources"):
+    content = read_file(INDEX_FILE)
+    if not content:
+        content = "# Wiki Index\n\n## Overview\n- [Overview](overview.md) — living synthesis\n\n## Sources\n\n## Entities\n\n## Concepts\n\n## Syntheses\n"
+    section_header = f"## {section}"
+    if section_header in content:
+        content = content.replace(section_header + "\n", section_header + "\n" + new_entry + "\n")
+    else:
+        content += f"\n{section_header}\n{new_entry}\n"
+    write_file(INDEX_FILE, content)
+
+
+def validate_ingest(changed_pages: list[str] | None = None) -> dict:
+    """Validate wiki integrity after an ingest.
+
+    Checks:
+      1. Broken wikilinks in changed pages (or all pages if none specified)
+      2. Pages not registered in index.md
+
+    Returns dict with 'broken_links' and 'unindexed' lists.
+    """
+    existing_pages = {p.stem.lower() for p in all_wiki_pages()}
+    index_content = read_file(INDEX_FILE).lower()
+
+    # Determine which pages to scan for broken links
+    if changed_pages:
+        scan_paths = [WIKI_DIR / p for p in changed_pages if (WIKI_DIR / p).exists()]
+    else:
+        scan_paths = [p for p in WIKI_DIR.rglob("*.md")
+                      if p.name not in ("index.md", "log.md", "lint-report.md")]
+
+    # Check 1: Broken wikilinks
+    broken_links = []
+    for page_path in scan_paths:
+        content = read_file(page_path)
+        rel = str(page_path.relative_to(WIKI_DIR))
+        for link in extract_wikilinks(content):
+            # Normalize: strip paths, check stem only
+            link_stem = Path(link).stem.lower() if '/' in link else link.lower()
+            if link_stem not in existing_pages:
+                broken_links.append((rel, link))
+
+    # Check 2: Unindexed pages (only check changed pages)
+    unindexed = []
+    for p in (changed_pages or []):
+        page_path = WIKI_DIR / p
+        if page_path.exists():
+            # Check if the page filename appears in index.md
+            stem = page_path.stem.lower()
+            if stem not in index_content and p not in ("log.md", "overview.md"):
+                unindexed.append(p)
+
+    return {"broken_links": broken_links, "unindexed": unindexed}
+
+
+def convert_to_md(source: Path) -> Path:
+    """Convert a non-markdown file to .md using markitdown.
+
+    Returns the path to the converted .md file (in a temp location).
+    Raises RuntimeError on failure so callers can handle it without sys.exit.
+    """
+    try:
+        from markitdown import MarkItDown
+    except ImportError:
+        raise RuntimeError(
+            "markitdown not installed (needed to convert non-.md files). "
+            "Install with: pip install markitdown"
+        )
+
+    md = MarkItDown(enable_plugins=False)
+    try:
+        result = md.convert(str(source))
+    except Exception as e:
+        raise RuntimeError(f"failed to convert '{source.name}': {e}") from e
+
+    # Always write to a temp directory — Raw/ is read-only and must not be modified
+    tmp = Path(tempfile.mkdtemp()) / f"{source.stem}.md"
+    tmp.write_text(result.text_content, encoding="utf-8")
+
+    print(f"  ✓ Converted {source.name} → {tmp.name} (temp: {tmp.parent})")
+    return tmp
+
+
+def detect_annotation_type(source: Path) -> str:
+    """Determine annotation type from the Raw/ subdirectory the file lives in.
+
+    Returns the Chinese annotation string per AGENTS.md §二.
+    Falls back to '（据文献）' if the path cannot be resolved.
+    """
+    try:
+        parts = source.resolve().relative_to((REPO_ROOT / "Raw").resolve()).parts
+        subdir = parts[0].lower() if parts else ""
+    except ValueError:
+        subdir = ""
+    mapping = {
+        "sources": "（据文献）",
+        "thoughts": "（个人思考）",
+        "records": "（个人经验）",
+    }
+    return mapping.get(subdir, "（据文献）")
+
+
+def validate_slug(slug: str) -> str:
+    """Ensure the slug is kebab-case English, no Chinese characters, no pinyin patterns.
+
+    If the slug contains non-ASCII characters, warn and return a sanitised fallback.
+    """
+    import unicodedata
+    has_non_ascii = any(ord(c) > 127 for c in slug)
+    if has_non_ascii:
+        # Strip non-ASCII and warn
+        clean = re.sub(r'[^\x00-\x7F]+', '', slug).strip('-')
+        clean = re.sub(r'-+', '-', clean) or "untitled"
+        print(f"  ⚠️  Slug '{slug}' contains non-ASCII characters. Sanitised to '{clean}'.")
+        print(f"       Please rename the file manually to a proper English kebab-case slug.")
+        return clean
+    return slug
+
+
+def ingest(source_path: str, auto_convert: bool = True) -> bool:
+    """Ingest a single source file. Returns True on success, False on skippable failure.
+
+    Never calls sys.exit() — callers in batch mode should continue on False.
+    """
+    source = Path(source_path)
+    if not source.exists():
+        print(f"  ⚠️  File not found: {source_path} — skipping")
+        _write_error_log(f"ingest | file not found: {source_path}")
+        return False
+
+    # Determine annotation type BEFORE any conversion (path must still point to Raw/)
+    annotation_type = detect_annotation_type(source)
+
+    # Auto-convert non-markdown files
+    converted_path = None
+    if source.suffix.lower() != ".md":
+        if not auto_convert:
+            print(f"  Skipping non-.md file (--no-convert): {source.name}")
+            return False
+        if source.suffix.lower() not in CONVERTIBLE_EXTENSIONS:
+            print(f"  ⚠️  Unsupported format: {source.suffix} — skipping {source.name}")
+            print(f"       Supported: {', '.join(sorted(ALL_SUPPORTED_EXTENSIONS))}")
+            return False
+        print(f"  Converting {source.name} to markdown...")
+        try:
+            converted_path = convert_to_md(source)
+        except RuntimeError as e:
+            print(f"  ✗ Conversion failed: {e}")
+            _write_error_log(f"ingest | conversion failed: {source.name}: {e}")
+            return False
+        source = converted_path
+
+    source_content = source.read_text(encoding="utf-8")
+    source_hash = sha256(source_content)
+    today = date.today().isoformat()
+
+    print(f"\nIngesting: {source.name}  (hash: {source_hash})")
+
+    wiki_context = build_wiki_context()
+    schema = read_file(SCHEMA_FILE)
+
+    prompt = f"""You are maintaining an LLM Wiki. Process this source document and integrate its knowledge into the wiki.
+
+Schema and conventions:
+{schema}
+
+Current wiki state (index + recent pages):
+{wiki_context if wiki_context else "(wiki is empty — this is the first source)"}
+
+New source to ingest (file: {source.relative_to(REPO_ROOT) if source.is_relative_to(REPO_ROOT) else source.name}):
+
+ANNOTATION TYPE FOR THIS SOURCE: {annotation_type}
+Apply this annotation to ALL non-verbatim claims written into Wiki concept/entity pages.
+- For Sources/ files: quotes/original text need no annotation; inferred opinions/summaries get {annotation_type}
+- For Thoughts/ files: all personal analysis and reasoning gets {annotation_type}
+- For Records/ files: all subjective content, decisions, and experience gets {annotation_type}
+
+=== SOURCE START ===
+{source_content}
+=== SOURCE END ===
+
+Today's date: {today}
+
+Return ONLY a valid JSON object with these fields (no markdown fences, no prose outside the JSON):
+{{
+  "title": "Human-readable title for this source",
+  "slug": "kebab-case English semantic words (2-4 words). RULES: NO pinyin, NO Chinese characters, translate Chinese titles to English. Example: 人性论 → treatise-human-nature",
+  "source_page": "full markdown content for wiki/sources/<slug>.md — use the source page format from the schema. CRITICAL: Aggressively convert key people, products, concepts and projects into [[Wikilinks]] inline in the text. Omitting [[ ]] for known terms is a failure.",
+  "index_entry": "- [Title](sources/slug.md) — one-line summary",
+  "overview_update": "full updated content for wiki/overview.md, or null if no update needed",
+  "entity_pages": [
+    {{"path": "entities/EntityName.md", "content": "full markdown content"}}
+  ],
+  "concept_pages": [
+    {{"path": "concepts/ConceptName.md", "content": "full markdown content"}}
+  ],
+  "contradictions": ["describe any contradiction with existing wiki content, or empty list"],
+  "log_entry": "## [{today}] ingest | <title> | [[Raw/<subdir>/<filename>]] | sha256:{source_hash} | slug:<slug>\\n\\nAdded source. Key claims: ..."
+}}
+"""
+
+    print(f"  calling API (model: {os.environ.get('LLM_MODEL', '(default)')})")
+    raw = call_llm(prompt, max_tokens=8192, exit_on_error=False)
+    if raw.startswith("> "):  # API call failed
+        print(f"\n  ⚠️  LLM API unavailable: {raw[2:]}")
+        print(f"  ℹ️  Source: {source.name} ({len(source_content)} chars)")
+        print(f"  ℹ️  Agent should create pages manually. Required fields:")
+        print(f"       - wiki/sources/<slug>.md")
+        print(f"       - wiki/concepts/*.md or wiki/entities/*.md")
+        print(f"       - update wiki/index.md, wiki/log.md, wiki/overview.md")
+        _write_error_log(f"ingest | LLM API unavailable for: {source.name}")
+        return False
+
+    try:
+        data = parse_json_from_response(raw)
+    except (ValueError, json.JSONDecodeError) as e:
+        print(f"  ✗ Error parsing API response: {e}")
+        print(f"  ℹ️  Agent should create pages manually from source: {source.name}")
+        import tempfile as _tempfile
+        debug_path = Path(_tempfile.gettempdir()) / "ingest_debug.txt"
+        print(f"  Raw response saved to {debug_path}")
+        debug_path.write_text(raw, encoding="utf-8")
+        _write_error_log(f"ingest | JSON parse failed for: {source.name}: {e}")
+        return False
+
+    # Validate and sanitise slug (no Chinese / pinyin)
+    slug = validate_slug(data["slug"])
+    write_file(WIKI_DIR / "sources" / f"{slug}.md", data["source_page"])
+
+    # Write entity pages
+    for page in data.get("entity_pages", []):
+        write_file(WIKI_DIR / page["path"], page["content"])
+
+    # Write concept pages
+    for page in data.get("concept_pages", []):
+        write_file(WIKI_DIR / page["path"], page["content"])
+
+    # Update overview
+    if data.get("overview_update"):
+        write_file(OVERVIEW_FILE, data["overview_update"])
+
+    # Update index
+    update_index(data["index_entry"], section="Sources")
+
+    # Build canonical log entry with sha256 + slug (override LLM-generated one to
+    # guarantee format correctness — B2 fix: use \n directly, not \\n in f-string)
+    raw_file_path = Path(source_path)  # original path before conversion
+    try:
+        raw_rel = raw_file_path.resolve().relative_to(REPO_ROOT.resolve()).as_posix()
+    except ValueError:
+        raw_rel = raw_file_path.name
+    title_for_log = data.get("title", slug)
+    canonical_log = (
+        f"## [{today}] ingest | {title_for_log} | [[{raw_rel}]]"
+        f" | sha256:{source_hash} | slug:{slug}\n\n"
+        f"Added source. Key claims: {'; '.join(str(c) for c in data.get('contradictions', [])) or 'see source page'}"
+    )
+    append_log(canonical_log)
+
+    # Report contradictions
+    contradictions = data.get("contradictions", [])
+    if contradictions:
+        print("\n  ⚠️  Contradictions detected:")
+        for c in contradictions:
+            print(f"     - {c}")
+
+    # --- Post-ingest validation ---
+    created_pages = [f"sources/{slug}.md"]
+    for page in data.get("entity_pages", []):
+        created_pages.append(page["path"])
+    for page in data.get("concept_pages", []):
+        created_pages.append(page["path"])
+    updated_pages = ["index.md", "log.md"]
+    if data.get("overview_update"):
+        updated_pages.append("overview.md")
+
+    validation = validate_ingest(created_pages)
+
+    print(f"\n{'='*50}")
+    print(f"  ✅ Ingested: {data['title']}")
+    print(f"{'='*50}")
+    print(f"  Created : {len(created_pages)} pages")
+    for p in created_pages:
+        print(f"           + wiki/{p}")
+    print(f"  Updated : {len(updated_pages)} pages")
+    for p in updated_pages:
+        print(f"           ~ wiki/{p}")
+    if contradictions:
+        print(f"  Warnings: {len(contradictions)} contradiction(s)")
+    if validation["broken_links"]:
+        print(f"  ⚠️  Broken links: {len(validation['broken_links'])}")
+        for page, link in validation["broken_links"][:10]:
+            print(f"           wiki/{page} → [[{link}]]")
+        if len(validation["broken_links"]) > 10:
+            print(f"           ... and {len(validation['broken_links']) - 10} more")
+    if validation["unindexed"]:
+        print(f"  ⚠️  Not in index.md: {len(validation['unindexed'])}")
+        for p in validation["unindexed"][:10]:
+            print(f"           wiki/{p}")
+        if len(validation["unindexed"]) > 10:
+            print(f"           ... and {len(validation['unindexed']) - 10} more")
+    if not validation["broken_links"] and not validation["unindexed"]:
+        print("  ✓ Validation passed — no broken links, all pages indexed")
+    print()
+    return True
+
+
+if __name__ == "__main__":
+    init_env()
+    ensure_utf8()
+
+    # Handle --validate-only flag
+    if len(sys.argv) == 2 and sys.argv[1] == "--validate-only":
+        print("Running wiki validation (no ingest)...\n")
+        result = validate_ingest()
+        if result["broken_links"]:
+            print(f"Broken wikilinks: {len(result['broken_links'])}")
+            for page, link in result["broken_links"][:20]:
+                print(f"  wiki/{page} → [[{link}]]")
+            if len(result["broken_links"]) > 20:
+                print(f"  ... and {len(result['broken_links']) - 20} more")
+        else:
+            print("No broken wikilinks found.")
+        print()
+        pages = all_wiki_pages()
+        index_content = read_file(INDEX_FILE).lower()
+        unindexed_all = []
+        for p in WIKI_DIR.rglob("*.md"):
+            if p.name in ("index.md", "log.md", "lint-report.md", "overview.md"):
+                continue
+            if p.stem.lower() not in index_content:
+                unindexed_all.append(str(p.relative_to(WIKI_DIR)))
+        if unindexed_all:
+            print(f"Pages not in index.md: {len(unindexed_all)}")
+            for up in unindexed_all[:20]:
+                print(f"  wiki/{up}")
+            if len(unindexed_all) > 20:
+                print(f"  ... and {len(unindexed_all) - 20} more")
+        else:
+            print("All pages are indexed.")
+        sys.exit(0)
+
+    # Parse flags
+    no_convert = "--no-convert" in sys.argv
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+
+    # Bare `ingest` with no file arguments — scan Raw/ and process pending files
+    if not args:
+        success, errors = ingest_pending(auto_convert=not no_convert)
+        sys.exit(0 if errors == 0 else 1)
+
+    paths_to_process = []
+    for arg in args:
+        p = Path(arg)
+        if p.is_file():
+            ext = p.suffix.lower()
+            if ext in ALL_SUPPORTED_EXTENSIONS:
+                paths_to_process.append(p)
+            else:
+                print(f"  ⚠️  Skipping unsupported format: {p.name} ({ext})")
+        elif p.is_dir():
+            for f in p.rglob("*"):
+                if f.is_file() and f.suffix.lower() in ALL_SUPPORTED_EXTENSIONS:
+                    paths_to_process.append(f)
+        else:
+            import glob
+            for f in glob.glob(arg, recursive=True):
+                g_p = Path(f)
+                if g_p.is_file() and g_p.suffix.lower() in ALL_SUPPORTED_EXTENSIONS:
+                    paths_to_process.append(g_p)
+
+    # Deduplicate while preserving order
+    unique_paths = []
+    seen: set[Path] = set()
+    for p in paths_to_process:
+        abs_p = p.resolve()
+        if abs_p not in seen:
+            seen.add(abs_p)
+            unique_paths.append(p)
+
+    if not unique_paths:
+        print("Error: no supported files found to ingest.")
+        print(f"Supported formats: {', '.join(sorted(ALL_SUPPORTED_EXTENSIONS))}")
+        sys.exit(1)
+
+    if len(unique_paths) > 1:
+        print(f"Batch mode: found {len(unique_paths)} files to ingest.")
+
+    errors = 0
+    for p in unique_paths:
+        ok = ingest(str(p), auto_convert=not no_convert)
+        if not ok:
+            errors += 1
+
+    if errors:
+        print(f"\n⚠️  {errors} file(s) failed — see ERROR entries in Wiki/log.md")
+    sys.exit(0 if errors == 0 else 1)
