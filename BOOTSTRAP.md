@@ -1,4 +1,4 @@
-# LLM Wiki 仓库自举提示词（Bootstrap Prompt v3.4）
+# LLM Wiki 仓库自举提示词
 
 > **本文件用途**：将本文件复制到任意空白目录，交给一个具备文件系统与 Shell 工具的 AI Agent（如 Cursor、Claude Code、OpenCode 等）。
 > Agent 阅读本文件后，将在该目录中**完整创建**一个符合 LLM Wiki 规范的三层知识操作系统。
@@ -134,6 +134,7 @@ workspace.json
 
 # 图谱与工具缓存
 Graph/.cache.json
+Graph/.refresh_cache.json
 
 # 临时诊断文件
 Wiki/_semantic_lint_context.md
@@ -187,14 +188,40 @@ Thumbs.db
 ```markdown
 # Tools 层说明
 
-工具脚本在首次执行对应触发词时由 Agent 按需生成，无需手动创建。
-生成后可直接运行，实现逻辑见 AGENTS.md 对应章节。
+工具脚本分两类：Agent 触发类在首次对话触发时自动生成；命令行工具需手动运行。
+
+## Agent 触发类（对话中说触发词即可）
 
 | 脚本 | 触发词 | LLM 调用 | 频率 |
 |------|--------|---------|------|
 | `health.py` | `health` | 零 | 每次会话必跑 |
 | `lint.py` | `lint` | 是（消耗 token） | 每 10–15 次摄入后 |
-| `build_graph.py` | `build graph` | 否 | 按需 |
+| `build_graph.py` | `build graph` | 条件性（见下注） | 按需 |
+| `ingest.py` | `ingest` / `ingest <file>` | 是 | 摄入时自动触发 |
+
+> `build_graph.py` Pass 1（提取显式双链）零 LLM 调用；设置 `LLM_MODEL_FAST`
+> 环境变量可选启用 Pass 2 语义推断边（消耗 token）。
+
+## 命令行工具类（直接在终端运行）
+
+| 脚本 | 用途 | LLM 调用 |
+|------|------|---------|
+| `pdf2md.py` | 将 PDF / arXiv 论文转换为 Markdown 并存入 `Raw/Sources/` | 零 |
+| `refresh.py` | 检测原始文件变更并重新摄入对应 Wiki 词条 | 是 |
+
+### 快速参考
+
+```bash
+# PDF / arXiv 转换后摄入
+python Tools/pdf2md.py 2401.12345
+python Tools/pdf2md.py paper.pdf --backend marker
+python Tools/ingest.py Raw/Sources/2401-12345.md
+
+# 检测并刷新已变更的原始文件
+python Tools/refresh.py              # 只刷新变更项
+python Tools/refresh.py --force      # 强制重新摄入全部
+python Tools/refresh.py --dry-run    # 仅列出待刷新项，不执行
+```
 ```
 
 ### 1.8 写入 Wiki 初始核心文件
@@ -255,13 +282,13 @@ git add AGENTS.md README.md .gitignore Raw/ Wiki/ Graph/ Tools/
 `Wiki/log.md` 末尾追加（将 `<YYYY-MM-DD>` 替换为当天日期）：
 
 ```
-## [<YYYY-MM-DD>] bootstrap | LLM Wiki OS v3.4 骨架建立
+## [<YYYY-MM-DD>] bootstrap | LLM Wiki OS v3.5 骨架建立
 ```
 
 ### 1.11 首次 Git 提交
 
 ```bash
-git commit -m "chore: bootstrap LLM Wiki OS v3.4"
+git commit -m "chore: bootstrap LLM Wiki OS v3.5"
 ```
 
 若用户在 §1.1 提供了远程仓库 URL：
@@ -751,7 +778,11 @@ git commit -m "query-synthesis: <问题简写>"
 
 若 `Tools/build_graph.py` 尚不存在，Agent 在首次执行 `build graph` 时根据以下规格自动生成该脚本，然后运行。
 
-运行：`python Tools/build_graph.py [--open] [--report] [--save]`
+运行：`python Tools/build_graph.py [--open] [--report] [--save] [--no-infer] [--clean]`
+
+**LLM 调用说明**：`build_graph.py` 分两个 Pass 执行：
+- **Pass 1（默认）**：扫描所有 Wiki 页面，提取显式 `[[双链]]` 构建基础图谱，**零 LLM 调用**
+- **Pass 2（可选）**：语义推断隐性关联边，**消耗 token**。需设置环境变量 `LLM_MODEL_FAST` 启用；未设置时自动跳过，不报错。使用 `--no-infer` 可强制跳过 Pass 2
 
 若 Python 环境不可用，手动构建：
 1. 扫描所有 Wiki 页面，提取全部 `[[双链]]`
@@ -865,18 +896,18 @@ git commit -m "graph: rebuild graph data"
 
 ```bash
 # 1. 复制本文件到目标目录
-cp BOOTSTRAP_v3.4.md /path/to/new-vault/
+cp BOOTSTRAP_v3.5.md /path/to/new-vault/
 
 # 2. 切换到目标目录
 cd /path/to/new-vault
 
 # 3. 在 AI 助手（Cursor / Claude Code 等）会话中说：
-#    "请阅读 BOOTSTRAP_v3.4.md 并严格执行其中的 bootstrap 工作流"
+#    "请阅读 BOOTSTRAP_v3.5.md 并严格执行其中的 bootstrap 工作流"
 ```
 
 ---
 
-## 4. 设计哲学（Why v3.4）
+## 4. 设计哲学（Why v3.5）
 
 这套系统的本质是**隔离与编译**，加上**最小摩擦**。
 
@@ -891,20 +922,3 @@ cd /path/to/new-vault
 
 **默认自动执行，例外才挂起**：知识库只有在维护成本足够低时才能长期运转。
 
----
-
-## Changelog
-
-> **2026-06-07 v3.4** — 四处结构优化：①删除 `§一` 中重复的物理目录树，改为仅列路径规范规则，目录树以 `§0` 为唯一权威；②删除 `§1.1` 中"本地 LLM"询问项（该配置在后续工作流中无实际调用点，询问无意义）；③删除工具脚本骨架写入步骤（`§1.8`），改为在 `§七/八/九` 明确"首次触发时按需生成"，脚本规格由对应章节检查项定义；④将原 `§十二`（裸摄入默认行为）合并至 `§四` 开头作为前提条件，消除规则分散问题。另将 bootstrap 清单步骤编号同步更新（删除原第 8 步后重排）。
-
-> **2026-06-07 v3.3** — 两处修订：①全文将 `Thoughts/` 的加注统一从「个人分析」改为「个人思考」；②重写 §二【Assets 定位与图片读取规则】，修复"Assets 不摄入"与"LLM 应读取图片补充上下文"之间的逻辑矛盾。
-
-> **2026-06-07 v3.2** — 八处修订：①§1.1 新增 Raw 层目录自定义询问项；②§四删除摄入处理顺序建议；③§六查询工作流新增"开放问题预读"步骤；④§七健康检查新增"Assets 断链检查"；⑤§八 Lint 新增"知识推荐"功能与"图谱张力指标"；⑥§九 Graph 工作流明确 `relation` 字段规范；⑦§1.8 工具脚本骨架补充"待实现指标"列表；⑧`Raw/README.md` 精简为纯研究者视角。
-
-> **2026-06-07 v3.1** — 五处工程细节修订：①§十命名规范补充 kebab-case 中文强制英文语义词组规则；②§3.1 Concept Schema 加入可选 `event_date` 字段；③§3.2 Entity 定义前新增 Concept/Entity 边界判断规则；④§3.5 Synthesis Schema 加入可选 `status`、`open_questions`、`event_date` 字段；⑤§3.1 `related` 字段加入语义边类型注释占位。
-
-> **2026-06-07 v3.0** — Raw 层由自由子目录改为固定三类（Sources / Thoughts / Records / Assets），目录决定加注类型；删除 Draft→Stable 晋升门控；摄入前新词条确认改为默认自动+结尾汇总；任务追踪机制改为 Agent 环境自适应；查询生长层次三触发条件改为纯客观；Sources 摘要与 Entities 著作词条归属关系明确化；Lint 新增加注缺失检查项；Health 新增 Raw 目录合规检查。
-
-> **2026-06-07 v2.1** — 新增 ERROR 失败记录格式，强化可观测性设计。
-
-> **2026-06-07 v2.0** — 整合 v1.1 + v4.1，修复摄入挂起机制、补全会话启动规程、恢复工具骨架规范、新增 sources/ 层；Raw/ 完全只读，通过 log.md 追踪已摄入状态。
