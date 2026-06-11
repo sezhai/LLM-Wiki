@@ -366,17 +366,27 @@ git push -u origin main
 
 # AGENTS.md（最高操作契约）
 
-<!-- version: v1.0 | created: <YYYY-MM-DD> | last_schema_updated: <YYYY-MM-DD> -->
+<!-- version: v1.0 | created: 2026-06-11 | last_schema_updated: 2026-06-11 -->
 
 本文件是 Agent 每次执行前**必读**的最高宪法。所有工作流、规则、模板均以本文件为唯一权威来源。
-
+> ⚠️ **自我保护规则（元级约束，优先级高于所有工作流）**
+>
+> Agent **严禁**在任何工作流执行过程中修改本文件（`AGENTS.md`），包括但不限于：响应 `ingest`、`lint`、`build graph`、`chore` 等指令时的"顺带更新"、"Schema 演化建议"自动应用、或任何看似合理的"契约自修复"行为。
+>
+> **唯一例外**：研究者在对话中**明确、直接地**发出修改指令，例如：
+> - `"修改 AGENTS.md，将 X 改为 Y"`
+> - `"更新契约：……"`
+>
+> 即便研究者的指令在语义上暗示契约需要调整（如"以后 lint 触发阈值改成 15"），Agent 也必须**先询问确认**是否写入 AGENTS.md，而非自动写入。
+>
+> 违反此规则的任何修改均视为严重错误，Agent 须在对话中主动声明并回滚。
 ---
 
 ## AGENTS.md 修订记录
 
 | 版本 | 日期 | 修订内容 | 修订原因 |
 |------|------|----------|----------|
-| v1.0 | `<YYYY-MM-DD>` | 初始版本建立 | — |
+| v1.0 | 2026-06-11 | 初始版本建立 | — |
 
 > 当研究者与 Agent 发现某条规则反复产生不符合预期的结果时，应讨论是否修订本文件。修订后更新上表，并在 `log.md` 追加 `chore | AGENTS.md 修订 vX.X`。
 >
@@ -495,7 +505,12 @@ python -c "import Tools.common; print('common.py OK')"
 
 Raw 层由研究者完全掌管，Agent 只读取，不做任何修改或移动。Raw 层子目录在 bootstrap 时由研究者确认，Agent 根据文件所在目录**自动确定加注类型**（通过 `common.load_allowed_raw_dirs()` 读取 `.llm-wiki/raw-mapping.json`），无需猜测。
 
-<raw-dir-table>
+| Raw 子目录 | 存放内容 | Wiki 摄入加注 | 摘要策略 |
+|------------|----------|---------------|----------|
+| `Sources/` | 他人文档：论文、剪藏、技术规范、书籍 | `（据文献）` | 引文保真；他人观点与推论一律加注 |
+| `Thoughts/` | 自己写的研究笔记、思辨、逻辑推演 | `（个人思考）` | 提炼核心论点；个人判断加注 |
+| `Records/` | 个人记录：交易日志、聊天记录、复盘日记 | `（个人经验）` | 提炼决策逻辑与经验结论；主观内容加注 |
+| `Assets/` | 图片、PDF 附件 | — | 不独立摄入；摄入父文件时按需读取被引用的图片以补充上下文 |
 
 **【加注执行规则】**：
 
@@ -682,7 +697,7 @@ last_updated: YYYY-MM-DD
 
 **触发**：`ingest` 或 `ingest <file>`
 
-**当前摄入风格**：<ingest-style>（A = 批量自动，B = 单次参与；详见 §1.1 配置）
+**当前摄入风格**：A（批量自动）（A = 批量自动，B = 单次参与；详见 §1.1 配置）
 
 **【路径规范化】**：`ingest <file>` 接收的路径（绝对路径、相对于仓库根目录、相对于当前工作目录均可），在脚本入口处统一转为绝对路径（`pathlib.Path(arg).resolve()`），转换后再与 `log.md` 中记录的路径做 POSIX 格式比对。所有写入 `log.md` 的路径均存储为相对于仓库根目录的 POSIX 格式（如 `Raw/Sources/foo.md`）。
 
@@ -842,7 +857,7 @@ qmd embed --collection wiki
 
 **步骤 14. 工作流结尾汇总**：输出本次摄入的新建词条列表与 ERROR 记录数量（若有）。
 
-按 `.llm-wiki/config.json` 中的 `track_raw` 字段（见 §二【Raw/ 版本控制策略】）决定 Raw/ 跟踪行为。
+按 `.llm-wiki/config.json` 中的 `track_raw` 字段决定 Raw/ 跟踪行为。
 
 ---
 
@@ -858,7 +873,7 @@ qmd embed --collection wiki
   - `[--discard]`：删除残留的 `.ingest-state.json` 并退出，不执行摄入
   - `[--fix <file_path>]`：配合 ingest-fix 路径使用，重新摄入并**覆盖**原词条（不走增量合并，直接替换）
 
-- **退出码语义**（四值协议，见【exit 2 四种子情况的恢复路径】获取完整恢复路径说明）：
+- **退出码语义**（四值协议）：
   - `exit 0` = 全部成功
   - `exit 1` = 硬错误（文件损坏、转换失败、非法参数等），ERROR 已记录至 log.md
   - `exit 2` = 需人工介入，含四种子情况（`[HASH_CHANGED]`、`[NEEDS_REVIEW]`、`[NEEDS_REVIEW_WRITTEN]`、`[DISCUSS]`）；`[NEEDS_REVIEW]` 和 `[NEEDS_REVIEW_WRITTEN]` 情况下，须在 stderr 打印 `REMAINING_QUEUE: path1|path2|...`
@@ -961,7 +976,7 @@ qmd query "<问题关键词>" --collection raw --format json -n 8
 grep -r "<问题关键词>" Raw/ --include="*.md" -l
 ```
 
-- Raw 命中 → 基于原始笔记作答，末尾附注警告，同时触发生长层次二（见下）
+- Raw 命中 → 基于原始笔记作答，末尾附注警告，同时触发生长层次二
 - Raw 仍无命中 → 告知研究者该主题存在知识盲区，建议补充原始笔记
 
 **步骤 4. 生长机制触发**：
@@ -1074,6 +1089,7 @@ git commit -m "query-synthesis: <问题关键词>"
 
 **【Schema 演化提示】**：运行结束后，若审计发现了**反复出现的模式偏差**，在报告末尾附加提示：
 > 💡 Schema 演化建议：检测到以下反复出现的偏差，建议讨论是否修订 AGENTS.md……
+> Agent 输出此建议后须等待研究者明确确认，严禁自动写入 AGENTS.md（见文件顶部自我保护规则）。
 
 ---
 
@@ -1081,16 +1097,6 @@ git commit -m "query-synthesis: <问题关键词>"
 
 - **路径常量**：`REPO_ROOT`（基于 `pathlib.Path(__file__).resolve().parent.parent` 推算）、`WIKI_DIR`、`RAW_DIR`、`GRAPH_DIR`、`LOG_FILE`、`INDEX_FILE`、`OVERVIEW_FILE`
 - **环境加载**：模块导入时立即调用 `load_dotenv(REPO_ROOT / ".env", override=False)`，并加异常兜底（`ImportError` 时静默跳过，不阻断模块导入）
-- **终端 I/O 免疫机制**：模块导入时必须立即执行系统标准输出流的 UTF-8 重配置，以彻底防止 Windows 终端在打印含有 Emoji（如 📌、⚠️、🏷️）的日志时抛出 GBK 编码崩溃。强制要求包含以下代码：
-
-  ```python
-  import sys
-  if sys.stdout.encoding.lower() != 'utf-8':
-      sys.stdout.reconfigure(encoding='utf-8')
-  if sys.stderr.encoding.lower() != 'utf-8':
-      sys.stderr.reconfigure(encoding='utf-8')
-  ```
-
 - **解释器常量**：`PYTHON_BIN` — 使用 `shutil.which` 实现跨平台虚拟环境探测：
 
   ```python
@@ -1183,7 +1189,7 @@ git commit -m "query-synthesis: <问题关键词>"
 
 **LLM 调用说明**：
 - **Pass 1（默认）**：扫描所有 Wiki 页面，提取显式 `[[双链]]` 构建基础图谱，**零 LLM 调用**
-- **Pass 2（可选）**：语义推断隐性关联边，**消耗 token**。需设置环境变量 `LLM_MODEL_FAST` 启用；未设置时自动跳过。**Pass 2 必须通过 `common.call_llm(prompt, model=os.environ.get("LLM_MODEL_FAST"))` 实现**，禁止在 `build_graph.py` 内自行实现 LLM 调用逻辑。`model` 参数非 None，将按 `call_llm` 的优先级规则使用该指定模型（见 §七 common.py LLM 调用规格）。
+- **Pass 2（可选）**：语义推断隐性关联边，**消耗 token**。需设置环境变量 `LLM_MODEL_FAST` 启用；未设置时自动跳过。**Pass 2 必须通过 `common.call_llm(prompt, model=os.environ.get("LLM_MODEL_FAST"))` 实现**，禁止在 `build_graph.py` 内自行实现 LLM 调用逻辑。`model` 参数非 None，将按 `call_llm` 的优先级规则使用该指定模型。
 
 **【Pass 2 增量缓存机制】**：Pass 2 的语义推断结果持久化至 `Graph/.cache.json`（由 `.gitignore` 屏蔽，不入库），避免每次运行时对已处理节点重复推断：
 - 缓存键：节点文件路径 + 文件内容的 `sha256_short`
