@@ -1,4 +1,3 @@
 # LLM-Wiki创建提示词与工具
 
 - 将BOOTSTRAP提示词发给AI Agent，等待即可。
-- Tools中脚本按需下载使用即可。
