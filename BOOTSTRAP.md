@@ -16,7 +16,7 @@
 ├── AGENTS.md                  # 最高操作契约（按本文档 §2 写入）
 ├── README.md                  # 仓库使用说明（研究者视角，仅此一份）
 ├── .gitignore                 # 排除索引、缓存与编辑器配置
-├── .llm-wiki/                 # 机器可读配置（纳入 git 跟踪；ingest-queue.json 和 .standalone-*.flag 不入库）
+├── .llm-wiki/                 # 机器可读配置（纳入 git 跟踪；ingest-queue.json 不入库）
 │   ├── raw-mapping.json       # Raw 子目录→加注类型映射（单一事实源）
 │   └── domain-enum.json       # 合法 domain 枚举
 ├── Raw/                       # 只读事实池（Agent 严禁除读取之外的任何操作）
@@ -143,7 +143,7 @@ ls -la .
 - **Wiki 层用户可见分类**（sources / syntheses 标注为自动生成，研究者无需手动管理）
 - **三步上手**：
   1. 把文件放进 `Raw/` 对应子目录
-  2. 说 `ingest` 处理一批（默认 5 个）待摄入文件，处理完即停；说 `ingest --all` 处理全部待摄入文件；说 `ingest <文件名> <文件名> ...` 仅处理指定文件；说 `ingest --discuss` 切换为单篇讨论模式；若想临时处理某个文件而不影响批次进度，使用 `ingest --standalone <文件>`
+  2. 说 `ingest` 扫描全库取一批（默认 5 个）待摄入文件，处理完即停；说 `ingest <文件或目录>` 处理指定文件/目录下的文件（超过 5 个同样自动截断为一批）；说 `ingest --discuss` 切换为单篇讨论模式（每篇处理后暂停等待确认）
   3. 说 `query: <问题>` 触发查询
 - **qmd 集合初始化提示**：若已安装 qmd 但未初始化集合，健康检查会提示缺失，届时需运行：`qmd init --collection wiki Wiki/` 和 `qmd init --collection raw Raw/`
 - **Obsidian 设置提示**：`Settings -> Files and links` 中将 Attachment 路径设为 `Raw/Assets`，将 **New link format** 设置为 **Absolute path in vault**
@@ -195,7 +195,6 @@ Wiki/lint-report.md
 
 # 摄入批次清单（运行时临时状态，不入库）
 .llm-wiki/ingest-queue.json
-.llm-wiki/.standalone-*.flag
 
 # OS 文件
 .DS_Store
@@ -317,9 +316,6 @@ if sys.stdout.encoding.lower() != 'utf-8':
     import io
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
 
-# ─────────────────────────────────────────────
-# 路径常量（以 REPO_ROOT 为基准）
-# ─────────────────────────────────────────────
 REPO_ROOT         = Path(__file__).resolve().parent.parent
 WIKI_DIR          = REPO_ROOT / "Wiki"
 RAW_DIR           = REPO_ROOT / "Raw"
@@ -342,45 +338,64 @@ if ENV_FILE.exists():
                 k, v = line.split("=", 1)
                 os.environ[k.strip()] = v.strip()
 
-# ─────────────────────────────────────────────
-# Python 解释器
-# ─────────────────────────────────────────────
 PYTHON_BIN: str = sys.executable
 
-# ─────────────────────────────────────────────
-# CLI 可用性检测（统一入口，模块级缓存）
-# ─────────────────────────────────────────────
 def _check_cli(cmd: str) -> bool:
-    """检测指定 CLI 工具是否可用。"""
     try:
         _sp.run([cmd, "--version"], capture_output=True, timeout=5, check=True)
         return True
     except Exception:
-        return False
+        pass
+    try:
+        _sp.run([sys.executable, "-m", cmd, "--version"], capture_output=True, timeout=5, check=True)
+        return True
+    except Exception:
+        pass
+    if sys.platform == "win32":
+        try:
+            _sp.run(["powershell", "-NoProfile", "-Command", f"& '{cmd}' --version"],
+                    capture_output=True, timeout=5, check=True)
+            return True
+        except Exception:
+            pass
+    return False
 
 QMD_AVAILABLE:        bool = _check_cli("qmd")
 MARKITDOWN_AVAILABLE: bool = _check_cli("markitdown")
 
-# ─────────────────────────────────────────────
-# 路径归一化工具（Unicode NFC + 正斜杠）
-# ─────────────────────────────────────────────
+# qmd 可能是 .ps1 脚本（npm 安装），Windows 下需通过 powershell 调用
+_QMD_PS1_PATH: str = ""
+if QMD_AVAILABLE and sys.platform == "win32":
+    try:
+        _sp.run(["qmd", "--version"], capture_output=True, timeout=5, check=True)
+    except Exception:
+        try:
+            r = _sp.run(
+                ["powershell", "-NoProfile", "-Command", "(Get-Command qmd).Source"],
+                capture_output=True, timeout=10
+            )
+            _QMD_PS1_PATH = r.stdout.decode("utf-8", errors="replace").strip()
+        except Exception:
+            pass
+
+def _run_qmd(args: List[str], **kwargs):
+    """运行 qmd 命令，自动处理 Windows .ps1 兼容。"""
+    if _QMD_PS1_PATH:
+        cmd = ["powershell", "-NoProfile", "-File", _QMD_PS1_PATH] + args
+    else:
+        cmd = ["qmd"] + args
+    return _sp.run(cmd, **kwargs)
+
 def normalize_path_str(s: str) -> str:
-    """统一路径字符串为 NFC 规范化形式，并使用正斜杠分隔。"""
     return unicodedata.normalize("NFC", Path(s).as_posix())
 
-# ─────────────────────────────────────────────
-# I/O 工具
-# ─────────────────────────────────────────────
 def read_file(path: Path) -> str:
-    """读取文件，强制 UTF-8，返回空字符串若不存在。"""
     p = Path(path)
     if not p.exists():
         return ""
     return p.read_text(encoding="utf-8", errors="replace")
 
-
 def write_file(path: Path, content: str) -> None:
-    """原子写入：先写临时文件，再 os.replace() 重命名。自动创建父目录。"""
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=p.parent, suffix=".tmp")
@@ -395,18 +410,12 @@ def write_file(path: Path, content: str) -> None:
             pass
         raise
 
-
 def append_log(entry: str) -> None:
-    """向 log.md 追加一条日志记录（自动补换行）。"""
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(entry.rstrip("\n") + "\n")
 
-# ─────────────────────────────────────────────
-# 哈希工具
-# ─────────────────────────────────────────────
 def sha256_file(path, truncate=32):
-    """计算文件 SHA-256 哈希。truncate=None 返回完整哈希，默认截断前 32 位。"""
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(8192), b""):
@@ -414,9 +423,6 @@ def sha256_file(path, truncate=32):
     full = h.hexdigest()
     return full[:truncate] if truncate else full
 
-# ─────────────────────────────────────────────
-# Wiki/ 下排除的工具生成文件
-# ─────────────────────────────────────────────
 WIKI_EXCLUDED_NAMES: Set[str] = {
     "health-report.md",
     "lint-report.md",
@@ -425,24 +431,15 @@ WIKI_EXCLUDED_NAMES: Set[str] = {
     "_blind_spot_result.md",
 }
 
-# ─────────────────────────────────────────────
-# Wiki 根目录下的特殊文件（不参与图谱/孤页检查）
-# ─────────────────────────────────────────────
 WIKI_ROOT_SPECIAL_FILES: Set[str] = {"index.md", "log.md", "overview.md"}
 WIKI_ROOT_SPECIAL_STEMS: Set[str] = {"index", "log", "overview"}
 
-# ─────────────────────────────────────────────
-# 内容工具
-# ─────────────────────────────────────────────
 def extract_wikilinks(text: str) -> List[str]:
-    """从文本中提取所有 [[wikilink]] 目标（去重，去除别名部分）。"""
     raw = re.findall(r"\[\[([^\]]+)\]\]", text)
     targets = [item.split("|")[0].strip() for item in raw]
     return list(dict.fromkeys(targets))
 
-
 def all_wiki_pages() -> List[Path]:
-    """返回 Wiki/ 下所有 .md 文件的绝对路径列表（排除工具报告与临时文件）。"""
     if not WIKI_DIR.exists():
         return []
     return sorted(
@@ -450,13 +447,7 @@ def all_wiki_pages() -> List[Path]:
         if p.name not in WIKI_EXCLUDED_NAMES
     )
 
-
 def resolve_wikilink(name: str) -> Optional[Path]:
-    """
-    将 wikilink 目标解析为磁盘上的实际文件路径。
-    支持绝对路径（Wiki/concepts/X.md）、相对路径（concepts/X）、裸名称（X）。
-    内部统一做 NFC 归一化以兼容不同操作系统的 Unicode 形态。
-    """
     clean = unicodedata.normalize("NFC", name.rstrip("/"))
     if clean.lower().endswith(".md"):
         clean = clean[:-3]
@@ -475,13 +466,7 @@ def resolve_wikilink(name: str) -> Optional[Path]:
             return normalized.resolve()
     return None
 
-
 def load_allowed_raw_dirs() -> List[Dict]:
-    """
-    读取 .llm-wiki/raw-mapping.json，返回所有目录条目列表。
-    条目格式：{"name": str, "annotation": str|None, "ingest": bool, "description": str}
-    配置文件缺失时抛出明确错误。
-    """
     if not RAW_MAPPING.exists():
         raise FileNotFoundError(
             f"配置文件缺失：{RAW_MAPPING}\n"
@@ -495,12 +480,7 @@ def load_allowed_raw_dirs() -> List[Dict]:
         )
     return dirs
 
-
 def load_domain_enum() -> List[str]:
-    """
-    读取 .llm-wiki/domain-enum.json，返回合法 domain 枚举列表。
-    文件缺失时返回空列表（不阻断 health 检查，由检查函数自行处理）。
-    """
     if not DOMAIN_ENUM_FILE.exists():
         return []
     try:
@@ -509,14 +489,7 @@ def load_domain_enum() -> List[str]:
     except Exception:
         return []
 
-# ─────────────────────────────────────────────
-# 日志解析工具（统一入口）
-# ─────────────────────────────────────────────
 def parse_ingest_records(log_text: str) -> List[Tuple[str, str, str, str]]:
-    """
-    解析 log.md 中所有 ingest 记录，按物理顺序返回 [(date, raw_rel, sha256, slug), ...]。
-    调用方若需要"最新记录为准"的映射，应按物理顺序用 dict 覆盖（后出现的记录覆盖先出现的）。
-    """
     pattern = re.compile(
         r"^## \[(\d{4}-\d{2}-\d{2})\] ingest \| .+ \| \[\[(.+?)\]\] "
         r"\| sha256:([0-9a-f]{32}) \| slug:(\S+)",
@@ -524,9 +497,7 @@ def parse_ingest_records(log_text: str) -> List[Tuple[str, str, str, str]]:
     )
     return [(m.group(1), m.group(2), m.group(3), m.group(4)) for m in pattern.finditer(log_text)]
 
-
 def parse_frontmatter(content: str) -> dict:
-    """从 Markdown 文本中解析 YAML frontmatter，返回键值对字典。"""
     m = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
     if not m:
         return {}
@@ -537,18 +508,12 @@ def parse_frontmatter(content: str) -> dict:
             result[k.strip()] = v.strip()
     return result
 
-
 def check_slug_conflict(
     slug: str,
     target_dir: str,
     operation_type: str,
     raw_rel: Optional[str] = None,
 ) -> Tuple[bool, Optional[str]]:
-    """
-    检查 slug 是否在全局命名空间中被占用（所有 Wiki 子目录共享同一 slug 空间）。
-    若提供 raw_rel，还会对比冲突源是否来自同一原始文件（同源不视为冲突）。
-    """
-    # 检查所有 Wiki 子目录下的同名文件
     for subdir in ("concepts", "entities", "sources", "syntheses", "disambiguations"):
         target_path = WIKI_DIR / subdir / f"{slug}.md"
         if target_path.exists():
@@ -559,10 +524,9 @@ def check_slug_conflict(
                     if rec_slug == slug:
                         slug_raws.add(rec_raw)
                 if raw_rel in slug_raws:
-                    continue  # 同一源文件，非冲突
+                    continue
             return True, target_path.relative_to(REPO_ROOT).as_posix()
 
-    # 进一步检查 log 中的记录
     if LOG_FILE.exists() and raw_rel:
         log_text = LOG_FILE.read_text(encoding="utf-8")
         slug_to_raws: Dict[str, set] = {}
@@ -573,11 +537,7 @@ def check_slug_conflict(
 
     return False, None
 
-
 def parse_log_slugs(log_text: str) -> Dict[str, str]:
-    """
-    从 log.md 解析所有已记录的 {slug: operation_type} 映射。
-    """
     result: Dict[str, str] = {}
     for _, _, _, slug in parse_ingest_records(log_text):
         result[slug] = "ingest"
@@ -586,9 +546,7 @@ def parse_log_slugs(log_text: str) -> Dict[str, str]:
         result[m.group(1).strip()] = "query-synthesis"
     return result
 
-
 def list_pending_review() -> List[Path]:
-    """返回所有 frontmatter 中 pending_review: true 的词条路径列表。"""
     result = []
     for page in all_wiki_pages():
         content = read_file(page)
@@ -596,9 +554,7 @@ def list_pending_review() -> List[Path]:
             result.append(page)
     return result
 
-
 def find_pages_by_raw_source(raw_rel: str) -> List[Path]:
-    """返回所有引用了指定 Raw 文件的 Wiki 词条路径列表。"""
     result = []
     target = normalize_path_str(raw_rel)
 
@@ -612,9 +568,7 @@ def find_pages_by_raw_source(raw_rel: str) -> List[Path]:
             result.append(page)
     return result
 
-
 def parse_moved_paths(log_text: str) -> Dict[str, str]:
-    """解析 chore | move 记录，返回 {原始路径: 最新路径}。"""
     move_pattern = re.compile(
         r"^## \[\d{4}-\d{2}-\d{2}\] chore \| move: \[\[(.+?)\]\] -> \[\[(.+?)\]\]",
         re.MULTILINE
@@ -630,9 +584,7 @@ def parse_moved_paths(log_text: str) -> Dict[str, str]:
 
     return moves
 
-
 def load_graph_json() -> Optional[dict]:
-    """加载并解析 Graph/graph.json"""
     graph_file = GRAPH_DIR / "graph.json"
     if not graph_file.exists():
         return None
@@ -642,11 +594,6 @@ def load_graph_json() -> Optional[dict]:
         return None
 
 def agent_llm(prompt: str, output_var: str = "LLM_OUTPUT") -> str:
-    """
-    向 LLM 发出推理请求。
-    当前版本完全依赖外部 Agent（opencode/claude/cursor 等）通过控制台
-    捕获 [AGENT_LLM_REQUEST] 块并回传结果。
-    """
     request_id = str(uuid.uuid4())[:8]
     print(f"\n[AGENT_LLM_REQUEST:{request_id}] output_var={output_var}")
     print("-" * 60)
@@ -656,24 +603,17 @@ def agent_llm(prompt: str, output_var: str = "LLM_OUTPUT") -> str:
     print(f"请基于上述提示完成推理，并将结果作为 {output_var} 变量输出。\n")
     return "[AGENT_PENDING]"
 
-
-# ─────────────────────────────────────────────
-# 环境支持辅助
-# ─────────────────────────────────────────────
 def qmd_embed_wiki() -> None:
-    """对 wiki 集合执行 qmd embed 更新索引。"""
     if QMD_AVAILABLE:
         try:
-            _sp.run(
-                ["qmd", "embed", "--collection", "wiki"],
+            _run_qmd(
+                ["embed", "--collection", "wiki"],
                 cwd=REPO_ROOT, capture_output=True, timeout=60
             )
         except Exception:
             pass
 
-
 def git_add_commit(files: List[Path], message: str) -> None:
-    """添加并提交指定文件（相对于 REPO_ROOT）。失败时打印警告，不抛出异常。"""
     rel_paths = [str(f.relative_to(REPO_ROOT)) for f in files]
     try:
         _sp.run(["git", "add"] + rel_paths, cwd=REPO_ROOT, check=True, capture_output=True)
@@ -708,27 +648,19 @@ from Tools.common import (
     load_allowed_raw_dirs, load_domain_enum,
     sha256_file, list_pending_review, find_pages_by_raw_source,
     git_add_commit, parse_log_slugs, parse_moved_paths,
-    parse_ingest_records, QMD_AVAILABLE,
+    parse_ingest_records, QMD_AVAILABLE, _run_qmd,
     WIKI_ROOT_SPECIAL_STEMS,
 )
 
 
 def _all_wiki_pages_relative() -> Dict[str, Path]:
-    """
-    返回 {相对于REPO_ROOT的路径字符串: 绝对Path} 映射。
-    key 形如 "Wiki/concepts/某概念.md"，与 index.md 中的链接拼接后一致。
-    """
     return {
         p.relative_to(REPO_ROOT).as_posix(): p
         for p in all_wiki_pages()
     }
 
 
-# ─────────────────────────────────────────────
-# 各项检查
-# ─────────────────────────────────────────────
 def check_empty_pages(pages: Dict[str, Path]) -> List[str]:
-    """检查空文件 / 存根页（仅有 frontmatter，无正文内容）。"""
     issues = []
     for rel, p in pages.items():
         content = read_file(p)
@@ -739,12 +671,6 @@ def check_empty_pages(pages: Dict[str, Path]) -> List[str]:
 
 
 def check_index_sync(pages: Dict[str, Path]) -> List[str]:
-    """
-    检查 index.md 条目与磁盘实际文件是否一致。
-
-    index.md 中链接格式为相对路径（如 concepts/slug.md），
-    拼接 WIKI_DIR 后转为 REPO_ROOT 相对路径与 pages.keys() 比较。
-    """
     issues = []
     if not INDEX_FILE.exists():
         return ["index.md 不存在"]
@@ -773,16 +699,11 @@ def check_index_sync(pages: Dict[str, Path]) -> List[str]:
 
 
 def check_log_coverage(pages: Dict[str, Path]) -> List[str]:
-    """
-    检查词条页面在 log.md 中是否有对应记录。
-    - concepts/entities/sources/disambiguations 词条应有 ingest 记录
-    - syntheses 词条应有 query-synthesis 记录（直接通过 ingest 登记的不视为正规流程）
-    """
     issues = []
     if not LOG_FILE.exists():
         return ["log.md 不存在"]
     log_text = read_file(LOG_FILE)
-    slug_map = parse_log_slugs(log_text)  # {slug: operation_type}
+    slug_map = parse_log_slugs(log_text)
 
     excluded_names = WIKI_ROOT_SPECIAL_STEMS
     for rel, p in pages.items():
@@ -798,13 +719,11 @@ def check_log_coverage(pages: Dict[str, Path]) -> List[str]:
 
 
 def check_overview_placeholder() -> List[str]:
-    """检查 overview.md 中所有预定义的 section 是否仍为占位内容。"""
     issues = []
     if not OVERVIEW_FILE.exists():
         return ["overview.md 不存在"]
     content = read_file(OVERVIEW_FILE)
 
-    # 逐一匹配四个固定 section，并检查其后的正文是否只剩 HTML 注释
     sections = [
         "当前研究焦点",
         "跨领域关键联系",
@@ -818,7 +737,6 @@ def check_overview_placeholder() -> List[str]:
             issues.append(f'overview.md 缺少 section: "{sec_title}"')
             continue
         body = m.group(1).strip()
-        # 移除 HTML 注释后再判断是否为空
         body_clean = re.sub(r"<!--.*?-->", "", body, flags=re.DOTALL).strip()
         if not body_clean:
             issues.append(f'overview.md 的"{sec_title}"节仍为占位内容，请 Agent 更新')
@@ -826,7 +744,6 @@ def check_overview_placeholder() -> List[str]:
 
 
 def check_broken_links(pages: Dict[str, Path]) -> List[str]:
-    """检查所有 [[双链]] 的目标是否存在。"""
     issues = []
     for rel, p in pages.items():
         content = read_file(p)
@@ -844,7 +761,6 @@ def check_broken_links(pages: Dict[str, Path]) -> List[str]:
 
 
 def check_assets_links(pages: Dict[str, Path]) -> List[str]:
-    """检查 Assets 图片引用是否存在。"""
     issues = []
     for rel, p in pages.items():
         content = read_file(p)
@@ -861,7 +777,6 @@ def check_assets_links(pages: Dict[str, Path]) -> List[str]:
 
 
 def check_raw_dir_compliance() -> List[str]:
-    """检查 Raw/ 根目录下是否有未在配置中声明的子目录。"""
     issues = []
     if not RAW_DIR.exists():
         return ["Raw/ 目录不存在"]
@@ -879,10 +794,6 @@ def check_raw_dir_compliance() -> List[str]:
 
 
 def check_hash_consistency() -> List[str]:
-    """
-    检查已摄入文件的哈希是否与记录一致（支持 move/delete 追踪）。
-    若相关词条已被标记为 pending_review，则不再重复报告哈希变动。
-    """
     issues = []
     if not LOG_FILE.exists():
         return []
@@ -921,7 +832,6 @@ def check_hash_consistency() -> List[str]:
         else:
             current_hash = sha256_file(file_path)
             if current_hash != recorded_hash:
-                # 若该文件关联的所有 Wiki 词条均已标记 pending_review，则视为已知，不再报告
                 related = find_pages_by_raw_source(raw_rel)
                 if related and all(
                     re.search(r"^pending_review:\s*true\s*$", read_file(p), re.MULTILINE)
@@ -941,12 +851,6 @@ def check_pending_review() -> List[str]:
 
 
 def check_domain_compliance(pages: Dict[str, Path]) -> List[str]:
-    """
-    检查 Wiki 词条的 frontmatter domain 字段是否在合法枚举中。
-    仅在 frontmatter 区域内搜索，避免正文中的 domain 字样误匹配。
-    注意：domain 字段必须为单行 YAML 标量（如 domain: "哲学"），
-    多行块标量写法（> 或 |）会导致此检查误报，请避免使用。
-    """
     issues = []
     allowed = load_domain_enum()
     if not allowed:
@@ -972,35 +876,33 @@ def check_domain_compliance(pages: Dict[str, Path]) -> List[str]:
 
 
 def check_qmd_collections() -> List[str]:
-    """检查 qmd 是否安装且 wiki/raw 集合已初始化。若无法解析集合列表会给出明确提示。"""
     issues = []
     if not QMD_AVAILABLE:
         return issues
     try:
-        result = _sp.run(
-            ["qmd", "list-collections", "--format", "json"],
-            capture_output=True, text=True, timeout=5
+        result = _run_qmd(
+            ["collection", "list"],
+            capture_output=True, timeout=5
         )
         if result.returncode != 0:
-            issues.append("qmd list-collections 执行失败，无法检查集合状态")
+            issues.append("qmd collection list 执行失败，无法检查集合状态")
             return issues
-        data = json.loads(result.stdout)
-        if isinstance(data, dict):
-            data = data.get("collections", [])
-        collections = {c.get("name") for c in data if isinstance(c, dict)}
+        stdout = result.stdout.decode("utf-8", errors="replace")
+        collections = set()
+        for line in stdout.splitlines():
+            m = re.match(r"^(\w+)\s+\(qmd://", line)
+            if m:
+                collections.add(m.group(1))
         if "wiki" not in collections:
             issues.append("qmd wiki 集合未初始化，请运行: qmd init --collection wiki Wiki/")
         if "raw" not in collections:
             issues.append("qmd raw 集合未初始化，请运行: qmd init --collection raw Raw/")
-    except json.JSONDecodeError:
-        issues.append("qmd list-collections 返回非 JSON，无法检查集合状态（可能版本不兼容）")
     except Exception as e:
         issues.append(f"qmd 集合检查异常: {e}")
     return issues
 
 
 def check_ingest_queue_residual() -> List[str]:
-    """检查是否存在未完成的摄入批次遗留文件。"""
     issues = []
     if INGEST_QUEUE_FILE.exists():
         try:
@@ -1018,9 +920,6 @@ def check_ingest_queue_residual() -> List[str]:
     return issues
 
 
-# ─────────────────────────────────────────────
-# 主入口
-# ─────────────────────────────────────────────
 def run_health(save: bool = False, as_json: bool = False) -> int:
     pages = _all_wiki_pages_relative()
 
@@ -1102,30 +1001,8 @@ if __name__ == "__main__":
 
 ```python
 #!/usr/bin/env python3
-"""
-LLM Wiki 摄入工具 v1.0
-
-设计理念：Agent 是循环控制器，脚本是循环体。
-  - 脚本每次只处理一个文件（打印内容供 Agent 读取）
-  - Agent 写完词条后调用 --finalize，脚本输出 [CONTINUE] <完整命令> 或 [STOP]
-  - Agent 必须将 [CONTINUE] 后的命令原样执行，这是批量流程的唯一驱动机制
-
-运行方式：
-  python -m Tools.ingest                              # 扫描一批（默认5个）待摄入文件，处理第一个
-  python -m Tools.ingest --all                        # 扫描全库待摄入文件，处理第一个
-  python -m Tools.ingest <文件A> [文件B ...]           # 指定文件建队列，处理第一个
-  python -m Tools.ingest <文件路径> [--discuss] [--force] [--standalone]
-  python -m Tools.ingest --finalize <slug> <title> <raw_rel> [--standalone] [--brief "摘要"]
-  python -m Tools.ingest --skip <raw_rel>             # 跳过指定文件，推进队列
-
-退出码：
-  0 = 成功（含 [CONTINUE] 和 [STOP] 两种情况）
-  1 = 硬错误（文件不存在、转换失败等）
-  2 = 需人工介入（超大文件、slug 冲突等）
-"""
 
 import argparse
-import hashlib
 import json
 import re
 import subprocess
@@ -1140,24 +1017,23 @@ from Tools.common import (
     read_file, write_file, append_log,
     extract_wikilinks, all_wiki_pages, resolve_wikilink,
     load_allowed_raw_dirs, sha256_file, normalize_path_str,
-    check_slug_conflict, list_pending_review, git_add_commit,
+    check_slug_conflict, git_add_commit,
     find_pages_by_raw_source, parse_ingest_records, qmd_embed_wiki,
 )
 
-# 单文件内容显示上限（字符数），与 AGENTS.md §四 保持一致
 CONTENT_PREVIEW_CHARS = 4000
 MAX_BYTES             = 500_000
-DEFAULT_BATCH_SIZE    = 5   # AGENTS.md §四 触发表中标注"默认5个"，如需修改请同步更新 AGENTS.md
+DEFAULT_BATCH_SIZE    = 5
 
-AGENT_PENDING = "[AGENT_PENDING]"
+SUPPORTED_EXTS = {".md", ".txt", ".pdf", ".docx", ".pptx", ".xlsx", ".html", ".epub"}
 
 
-# ─────────────────────────────────────────────
-# 日志索引（物理顺序覆盖，最新记录为准）
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────
+# 日志索引（哈希去重基础）
+# ──────────────────────────────────────────────
+
 def _load_log_index() -> Dict[str, str]:
-    """解析 log.md 中所有 ingest 记录，返回 {raw_rel: sha256} 映射。
-    同一文件多次摄入时，以最后一条记录（最新哈希）为准。"""
+    """返回 {规范化相对路径: sha256前32位} 的已摄入记录。"""
     result: Dict[str, str] = {}
     if not LOG_FILE.exists():
         return result
@@ -1166,42 +1042,84 @@ def _load_log_index() -> Dict[str, str]:
     return result
 
 
-# ─────────────────────────────────────────────
-# 收集全库待摄入文件
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────
+# 候选文件收集
+# ──────────────────────────────────────────────
+
+def _collect_candidates_from_args(targets: List[str]) -> List[str]:
+
+    log_index = _load_log_index()
+    seen = set()
+    result = []
+
+    for t in targets:
+        p = Path(t)
+        # 支持绝对路径和相对路径
+        if not p.is_absolute():
+            # 先尝试从仓库根，再尝试从 Raw/
+            if (REPO_ROOT / p).exists():
+                p = REPO_ROOT / p
+            elif (RAW_DIR / p).exists():
+                p = RAW_DIR / p
+            else:
+                print(f"WARN: 路径不存在，跳过: {t}")
+                continue
+
+        if p.is_dir():
+            files = sorted(f for f in p.rglob("*")
+                           if f.is_file() and f.suffix.lower() in SUPPORTED_EXTS)
+        elif p.is_file():
+            files = [p]
+        else:
+            print(f"WARN: 路径不存在，跳过: {t}")
+            continue
+
+        for f in files:
+            try:
+                rel = normalize_path_str(f.relative_to(REPO_ROOT).as_posix())
+            except ValueError:
+                print(f"WARN: 路径不在仓库范围内，跳过: {f}")
+                continue
+            if rel in seen:
+                continue
+            seen.add(rel)
+            # 哈希去重：已摄入且内容未变则跳过
+            if rel in log_index and sha256_file(f) == log_index[rel]:
+                continue
+            result.append(rel)
+
+    return result
+
+
 def _collect_all_pending() -> List[str]:
-    """收集全库所有待摄入/已修改文件的相对路径列表（不写队列）。
-    判断标准：从未摄入，或 SHA-256 与日志记录不一致。"""
+    """扫描全库 Raw/ 中所有待摄入/已修改文件，返回规范化相对路径列表。"""
     log_index = _load_log_index()
     try:
         allowed = load_allowed_raw_dirs()
     except (FileNotFoundError, ValueError) as e:
         print(f"WARN: 无法加载目录配置：{e}")
         return []
-    ingest_dirs    = [d["name"] for d in allowed if d.get("ingest", True)]
-    supported_exts = {".md", ".txt", ".pdf", ".docx", ".pptx", ".xlsx", ".html", ".epub"}
+    ingest_dirs = [d["name"] for d in allowed if d.get("ingest", True)]
 
-    pending = []
+    result = []
     for dir_name in ingest_dirs:
         dir_path = RAW_DIR / dir_name
         if not dir_path.exists():
             continue
         for f in sorted(dir_path.rglob("*")):
-            if not f.is_file():
-                continue
-            if f.suffix.lower() not in supported_exts:
+            if not f.is_file() or f.suffix.lower() not in SUPPORTED_EXTS:
                 continue
             rel = normalize_path_str(f.relative_to(REPO_ROOT).as_posix())
             if rel not in log_index or sha256_file(f) != log_index[rel]:
-                pending.append(rel)
-    return pending
+                result.append(rel)
+    return result
 
 
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────
 # 队列管理
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────
+
 def _read_queue() -> Optional[dict]:
-    """读取并解析队列文件，失败返回 None。"""
     if not INGEST_QUEUE_FILE.exists():
         return None
     try:
@@ -1211,169 +1129,109 @@ def _read_queue() -> Optional[dict]:
 
 
 def _write_queue(data: dict) -> None:
-    """原子写入队列文件。"""
     write_file(INGEST_QUEUE_FILE, json.dumps(data, ensure_ascii=False, indent=2))
 
 
 def _queue_has_pending() -> bool:
-    """判断当前是否有未完成的批次。"""
     q = _read_queue()
     return bool(q and q.get("pending"))
 
 
-def scan_pending(batch_size: int = DEFAULT_BATCH_SIZE, full: bool = False) -> Optional[str]:
-    """
-    扫描待摄入文件，建立队列，返回第一个待处理文件的 rel 路径（供调用方立即处理）。
-    返回 None 表示无需处理（队列未清空或无待摄入文件）。
+def scan_and_build_queue(candidates: List[str]) -> Optional[str]:
+    """创建或恢复批次，返回第一个待处理文件路径；若无文件则返回 None。"""
+    existing = _read_queue()
+    if existing and existing.get("pending"):
+        pending_count = len(existing.get("pending", []))
+        if candidates:
+            print(
+                f"INFO: 当前批次剩余 {pending_count} 个文件未完成，"
+                f"先完成当前批次（指定的新文件将在下次扫描时纳入）。"
+            )
+        else:
+            print(f"INFO: 当前批次剩余 {pending_count} 个文件，继续处理。")
+        return existing["pending"][0]
 
-    full=False：取前 batch_size 个候选文件
-    full=True ：取全部候选文件
-    """
-    if _queue_has_pending():
-        existing = _read_queue()
-        print(
-            f"WARN: 当前有未完成批次（{len(existing['pending'])} 个待处理），"
-            f"请先完成当前批次，或删除 .llm-wiki/ingest-queue.json 重置。"
-        )
-        next_file = existing["pending"][0]
-        print(f"[CONTINUE] 立即执行：python -m Tools.ingest \"{next_file}\"")
-        return None
-
-    all_pending = _collect_all_pending()
-
-    if not all_pending:
-        print("OK: Raw 层暂无需要摄入或更新的文件。")
+    if not candidates:
+        print("OK: 暂无需要摄入或更新的文件。")
         if INGEST_QUEUE_FILE.exists():
             INGEST_QUEUE_FILE.unlink()
         return None
 
-    pending = all_pending if full else all_pending[:batch_size]
-    mode    = "scan-all" if full else "scan-batch"
+    total_candidates = len(candidates)
+    batch = candidates[:DEFAULT_BATCH_SIZE]
+    remaining_after = total_candidates - len(batch)
 
     queue_data = {
-        "created":           date.today().isoformat(),
-        "mode":              mode,
-        "total":             len(pending),
-        "total_candidates":  len(all_pending),
-        "pending":           pending,
-        "done":              [],
-        "skipped":           [],
+        "created":          date.today().isoformat(),
+        "total_candidates": total_candidates,
+        "total":            len(batch),
+        "pending":          batch,
+        "done":             [],
+        "skipped":          [],
     }
     _write_queue(queue_data)
 
-    remaining_after = len(all_pending) - len(pending)
-    print(f"INFO: 发现 {len(all_pending)} 个待摄入/已修改文件，本批次处理其中 {len(pending)} 个：")
-    for i, p in enumerate(pending, 1):
+    print(f"INFO: 发现 {total_candidates} 个待摄入/已修改文件，本批次处理其中 {len(batch)} 个：")
+    for i, p in enumerate(batch, 1):
         print(f"  {i}. {p}")
-
     if remaining_after > 0:
         print(
-            f"\n提示：本批次（{len(pending)} 个）处理完后将停止。"
-            f"剩余 {remaining_after} 个文件，可说 `ingest` 处理下一批，"
-            f"或说 `ingest --all` 一次性处理全部。"
+            f"\n提示：本批次（{len(batch)} 个）处理完后将停止。"
+            f"剩余 {remaining_after} 个文件，再次执行 `ingest` 处理下一批。"
         )
-    return pending[0]
+    return batch[0]
 
 
-def build_explicit_queue(files: List[str]) -> List[str]:
-    """
-    根据用户显式指定的文件列表建立临时批次队列。
-    处理完这些文件即停，不扩展到其他待摄入文件。
-    返回 normalized 路径列表（空列表表示失败）。
-    """
-    if _queue_has_pending():
-        existing = _read_queue()
-        print(
-            f"WARN: 当前有未完成批次（{len(existing['pending'])} 个待处理），"
-            f"新建队列将覆盖进度，请先完成当前批次。"
-        )
-        return []
-
-    pending = []
-    for f in files:
-        p = Path(f)
-        if p.is_absolute():
-            try:
-                rel = normalize_path_str(p.relative_to(REPO_ROOT).as_posix())
-            except ValueError:
-                print(f"WARN: 路径不在仓库范围内，跳过: {f}")
-                continue
-        else:
-            rel_as_posix = normalize_path_str(p.as_posix())
-            if (REPO_ROOT / rel_as_posix).exists():
-                rel = rel_as_posix
-            elif (RAW_DIR / rel_as_posix).exists():
-                rel = normalize_path_str((RAW_DIR / rel_as_posix).relative_to(REPO_ROOT).as_posix())
-            else:
-                rel = rel_as_posix
-
-        if not (REPO_ROOT / rel).exists():
-            print(f"WARN: 文件不存在，跳过: {rel}")
-            continue
-        pending.append(rel)
-
-    if not pending:
-        print("WARN: 指定的文件均不存在，未建立队列。")
-        return []
-
-    queue_data = {
-        "created": date.today().isoformat(),
-        "mode":    "explicit",
-        "total":   len(pending),
-        "pending": pending,
-        "done":    [],
-        "skipped": [],
-    }
-    _write_queue(queue_data)
-
-    print(f"INFO: 已建立指定批次队列（{len(pending)} 个文件）：")
-    for i, p in enumerate(pending, 1):
-        print(f"  {i}. {p}")
-    return pending
-
-
-# ─────────────────────────────────────────────
-# 批次进度推进（核心：输出 [CONTINUE] / [STOP] 信号）
-# ─────────────────────────────────────────────
-def _advance_queue(raw_rel: str, standalone: bool) -> None:
-    if standalone:
-        print("INFO: standalone 模式，本次摄入不计入批次统计。")
-        print("[STOP] 本次为独立摄入，批次不受影响。")
-        return
-
+def _advance_queue(raw_rel: str) -> None:
+    """将 raw_rel 从 pending 移入 done，并处理 skip→finalize 的补做路径。"""
     queue_data = _read_queue()
     if queue_data is None:
-        print("[STOP] 无批次清单，本次为独立摄入。")
+        print("[STOP] 无批次清单。")
         return
 
     pending = queue_data.get("pending", [])
     done    = queue_data.get("done", [])
+    skipped = queue_data.get("skipped", [])
 
     if raw_rel in done:
-        print(f"INFO: {raw_rel} 已在本批次中处理完成，跳过重复记录。")
+        # 重复 finalize（幂等）
         if pending:
-            print(f"[CONTINUE] 立即执行：python -m Tools.ingest \"{pending[0]}\"")
+            print(f"[CONTINUE] 立即执行：python -m Tools.ingest")
+        else:
+            print("[STOP] 批次已全部完成。")
+        return
+
+    # 修复 skip→finalize 路径：若文件曾被跳过，现补做完成，则从 skipped 移至 done
+    if raw_rel in skipped:
+        skipped.remove(raw_rel)
+        done.append(raw_rel)
+        queue_data["skipped"] = skipped
+        queue_data["done"]    = done
+        _write_queue(queue_data)
+        print(f"INFO: {raw_rel} 此前被标记为跳过，现已补做完成，已从 skipped 移至 done。")
+        if pending:
+            print(f"[CONTINUE] 立即执行：python -m Tools.ingest")
         else:
             print("[STOP] 批次已全部完成。")
         return
 
     if raw_rel not in pending:
-        print("[STOP] 该文件不属于当前批次，批次不受影响。")
+        print("[STOP] 该文件不属于当前批次。")
         return
 
-    # 推进：从 pending 移到 done
     pending.remove(raw_rel)
     done.append(raw_rel)
     queue_data["pending"] = pending
     queue_data["done"]    = done
     _write_queue(queue_data)
 
-    total     = len(done) + len(pending)
     remaining = len(pending)
+    total     = queue_data.get("total", len(done) + remaining)
 
     if remaining == 0:
-        INGEST_QUEUE_FILE.unlink()
-        print(f"\nOK: 批次完成（{len(done)}/{total}）。本轮 ingest 结束。")
+        if INGEST_QUEUE_FILE.exists():
+            INGEST_QUEUE_FILE.unlink()
+        print(f"\nOK: 批次完成（{len(done)}/{total}）。")
         print("[STOP] 批次已全部完成。")
         print(
             "\n>>> 批次后续建议："
@@ -1381,71 +1239,70 @@ def _advance_queue(raw_rel: str, standalone: bool) -> None:
             f"\n    2. 若本批次摄入 ≥3 个文件，建议运行：python -m Tools.lint"
         )
     else:
-        next_file = pending[0]
         print(f"\nINFO: 批次进度：{len(done)}/{total} 完成，剩余 {remaining} 个。")
-        print(f"[CONTINUE] 立即执行：python -m Tools.ingest \"{next_file}\"")
+        print(f"[CONTINUE] 立即执行：python -m Tools.ingest")
 
 
-# ─────────────────────────────────────────────
-# Standalone 标记文件（持久化意图传递）
-# 注意：标记文件基于文件路径生成可读文件名，因此即使 Raw 文件在
-# ingest_file 和 --finalize 之间被修改，standalone 意图也不会丢失。
-# ─────────────────────────────────────────────
-def _standalone_flag_path(file_path: Path) -> Path:
-    """
-    基于文件的 REPO_ROOT 相对路径生成可读标记文件路径。
-    将 '/' 替换为 '__'，过长时附加哈希确保不超限。
-    """
-    try:
-        rel = file_path.resolve().relative_to(REPO_ROOT).as_posix()
-    except ValueError:
-        rel = str(file_path)
-    safe = rel.replace("/", "__")
-    if len(safe) > 100:
-        h = hashlib.sha256(safe.encode()).hexdigest()[:16]
-        safe = safe[:80] + h
-    flag_dir = REPO_ROOT / ".llm-wiki"
-    flag_dir.mkdir(parents=True, exist_ok=True)
-    return flag_dir / f".standalone-{safe}.flag"
+def _skip_and_advance(raw_rel: str) -> None:
+    """将文件移入 skipped 列表并推进批次（含幂等检查和与 done 的交叉防护）。"""
+    queue_data = _read_queue()
+    if queue_data is None:
+        print("[STOP] 无批次清单。")
+        return
+    pending = queue_data.get("pending", [])
+    done    = queue_data.get("done", [])
+    skipped = queue_data.get("skipped", [])
+
+    # 交叉防护：已 finalize 完成的文件不能再标记为 skip
+    if raw_rel in done:
+        print(f"WARN: {raw_rel} 已通过 finalize 完成，无法再标记为 skip。")
+        if pending:
+            print(f"[CONTINUE] 立即执行：python -m Tools.ingest")
+        else:
+            print("[STOP] 批次已全部完成。")
+        return
+
+    # 重复 skip 幂等
+    if raw_rel in skipped:
+        if pending:
+            print(f"[CONTINUE] 立即执行：python -m Tools.ingest")
+        else:
+            print("[STOP] 批次已全部完成。")
+        return
+
+    if raw_rel in pending:
+        pending.remove(raw_rel)
+    skipped.append(raw_rel)
+    queue_data["pending"] = pending
+    queue_data["skipped"] = skipped
+    _write_queue(queue_data)
+
+    remaining = len(pending)
+    total     = queue_data.get("total", len(done) + remaining + len(skipped))
+
+    if remaining == 0:
+        if INGEST_QUEUE_FILE.exists():
+            INGEST_QUEUE_FILE.unlink()
+        print(f"\nOK: 批次完成（跳过 {len(skipped)} 个）。")
+        print("[STOP] 批次已全部完成。")
+    else:
+        print(f"\nINFO: 已跳过，批次剩余 {remaining} 个。")
+        print(f"[CONTINUE] 立即执行：python -m Tools.ingest")
 
 
-def _mark_standalone(file_path: Path) -> None:
-    """创建 standalone 标记文件。失败时打印警告并提醒在 --finalize 时显式传参。"""
-    try:
-        flag = _standalone_flag_path(file_path)
-        flag.touch()
-    except Exception as e:
-        print(f"WARN: 无法创建 standalone 标记文件: {e}。请在 --finalize 时显式传递 --standalone。")
+# ──────────────────────────────────────────────
+# 文件处理
+# ──────────────────────────────────────────────
 
-
-def _consume_standalone_flag(file_path: Path) -> bool:
-    """检查并消费 standalone 标记文件。存在则删除并返回 True。"""
-    try:
-        flag = _standalone_flag_path(file_path)
-        if flag.exists():
-            flag.unlink()
-            print("INFO: 检测到 standalone 标记文件，本次摄入不计入批次进度。")
-            return True
-    except Exception:
-        pass
-    return False
-
-
-# ─────────────────────────────────────────────
-# markitdown 文件转换
-# ─────────────────────────────────────────────
 def _convert_to_markdown(file_path: Path) -> Tuple[bool, str]:
-    """将任意支持格式转换为 Markdown 文本。.md 直接返回，其余调用 markitdown CLI。"""
     if file_path.suffix.lower() == ".md":
         return True, read_file(file_path)
-
     if not MARKITDOWN_AVAILABLE:
         print(
             f"WARN: markitdown 未安装，无法转换 {file_path.name}。\n"
             f"请运行 pip install 'markitdown>=0.1.0,<0.2.0' 后重试。"
         )
         return False, ""
-
     try:
         result = subprocess.run(
             ["markitdown", str(file_path)],
@@ -1461,75 +1318,15 @@ def _convert_to_markdown(file_path: Path) -> Tuple[bool, str]:
 
 
 def _get_annotation(file_path: Path) -> str:
-    """根据文件所在 Raw 子目录自动确定加注类型。"""
     try:
-        allowed  = load_allowed_raw_dirs()
-        mapping  = {d["name"]: d.get("annotation", "") for d in allowed}
-        parts    = file_path.relative_to(RAW_DIR).parts
+        allowed = load_allowed_raw_dirs()
+        mapping = {d["name"]: d.get("annotation", "") for d in allowed}
+        parts   = file_path.relative_to(RAW_DIR).parts
         if parts:
             return mapping.get(parts[0], "") or ""
-    except (FileNotFoundError, ValueError, Exception):
+    except Exception:
         pass
     return ""
-
-
-# ─────────────────────────────────────────────
-# index.md 更新
-# ─────────────────────────────────────────────
-def _update_index(slug: str, subdir: str, title: str, brief: str = "") -> None:
-    """
-    在 index.md 对应 section 末尾插入新词条链接。
-    确保 section 之间空行格式正确，避免空行累积。
-    """
-    if not INDEX_FILE.exists():
-        return
-    content = read_file(INDEX_FILE)
-
-    section_map = {
-        "concepts":        "## Concepts",
-        "entities":        "## Entities",
-        "sources":         "## Sources",
-        "syntheses":       "## Syntheses",
-        "disambiguations": "## Disambiguations",
-    }
-    section_header = section_map.get(subdir)
-    if not section_header:
-        return
-
-    if f"({subdir}/{slug}.md)" in content:
-        return
-
-    if section_header not in content:
-        return
-
-    brief_part = f" -- {brief.strip()}" if brief and brief.strip() else ""
-    link_line  = f"- [{title}]({subdir}/{slug}.md){brief_part}\n"
-
-    section_start = content.index(section_header)
-    insert_from   = section_start + len(section_header)
-    next_section  = content.find("\n## ", insert_from)
-
-    if next_section == -1:
-        stripped = content.rstrip("\n")
-        content  = stripped + "\n" + link_line
-    else:
-        block_before = content[:next_section].rstrip("\n")
-        block_after  = content[next_section + 1:]
-        content = block_before + "\n" + link_line + "\n" + block_after
-
-    write_file(INDEX_FILE, content)
-
-
-# ─────────────────────────────────────────────
-# 日志写入
-# ─────────────────────────────────────────────
-def _write_ingest_log(title: str, raw_rel: str, file_hash: str, slug: str) -> None:
-    today = date.today().isoformat()
-    entry = (
-        f"## [{today}] ingest | {title} | [[{raw_rel}]] "
-        f"| sha256:{file_hash} | slug:{slug}"
-    )
-    append_log(entry)
 
 
 def _write_error_log(operation: str, reason: str) -> None:
@@ -1537,38 +1334,25 @@ def _write_error_log(operation: str, reason: str) -> None:
     append_log(f"## [{today}] ERROR | {operation} | {reason}")
 
 
-# ─────────────────────────────────────────────
-# 单文件摄入主流程
-# ─────────────────────────────────────────────
-def ingest_file(
-    file_path: Path,
-    discuss_mode: bool = False,
-    standalone: bool   = False,
-    force: bool        = False,
-) -> int:
-    """
-    处理单个文件：读取内容，打印给 Agent，指引 Agent 写词条后调用 --finalize。
-    不做任何 Wiki 写入（由 Agent 完成）。
-    """
+def ingest_file(file_path: Path, discuss_mode: bool = False, force: bool = False) -> int:
+    """处理单个文件：输出内容摘要，引导 Agent 写词条，然后等待 --finalize 回传。"""
+    # 规范化路径
     try:
         rel = normalize_path_str(file_path.relative_to(REPO_ROOT).as_posix())
     except ValueError:
+        abs_path = (REPO_ROOT / file_path).resolve()
         try:
-            abs_path = (REPO_ROOT / file_path).resolve()
             rel = normalize_path_str(abs_path.relative_to(REPO_ROOT).as_posix())
             file_path = abs_path
-        except (ValueError, Exception):
+        except ValueError:
             print(f"WARN: 路径不在仓库范围内: {file_path}")
             return 1
 
     if not file_path.exists():
         print(f"WARN: 文件不存在: {rel}")
-        _remove_from_queue(rel, skip=True)
         _write_error_log(f"ingest | {file_path.name}", "文件不存在")
+        _skip_and_advance(rel)
         return 1
-
-    if standalone:
-        _mark_standalone(file_path)
 
     try:
         file_hash = sha256_file(file_path)
@@ -1592,22 +1376,18 @@ def ingest_file(
     if raw_size > MAX_BYTES and not force:
         print(
             f"\nWARN: 大文件警告：{rel}（{raw_size:,} 字节，约 {raw_size // 1000} KB）。\n"
-            f"建议将文件手动拆分为多个子文件后重新摄入，\n"
-            f"或使用 --force 强制摄入（可能超出上下文窗口）。"
+            f"建议手动拆分后重新摄入，或使用 --force 强制摄入。"
         )
         print("[NEEDS_REVIEW] 超大文件需人工确认。")
         return 2
 
-    if raw_size > MAX_BYTES and force:
-        print(f"WARN: 文件超大（{raw_size:,} 字节），已通过 --force 强制摄入，请注意上下文窗口限制。")
-
     ok, md_content = _convert_to_markdown(file_path)
     if not ok:
         _write_error_log(f"ingest | {file_path.name}", "文件转换失败")
-        _remove_from_queue(rel, skip=True)
-        print(f"[CONTINUE 或 STOP] 该文件已跳过，请执行：python -m Tools.ingest --skip \"{rel}\"")
+        _skip_and_advance(rel)
         return 1
 
+    # 源文件已修改：将关联词条标记为 pending_review
     log_index = _load_log_index()
     if rel in log_index and sha256_file(file_path) != log_index[rel]:
         related_pages = find_pages_by_raw_source(rel)
@@ -1621,12 +1401,10 @@ def ingest_file(
                     flags=re.MULTILINE,
                 )
                 write_file(page, updated)
-                print(f"INFO: 已标记 {page.name} 为 pending_review（源文件已修改）。建议先与研究者确认裁决方向后再更新该词条。")
+                print(f"INFO: 已标记 {page.name} 为 pending_review（源文件已修改）。")
 
     index_exists    = INDEX_FILE.exists()
     overview_exists = OVERVIEW_FILE.exists()
-
-    finalize_standalone_flag = " --standalone" if standalone else ""
 
     print(f"\n[INGEST_CONTENT] raw_rel={rel} hash={file_hash}")
     print(f"加注规则：所有观点/推论/主观内容加注 （{annotation}）" if annotation else "加注规则：无需加注")
@@ -1634,15 +1412,15 @@ def ingest_file(
     print(f"Wiki 索引: {'存在' if index_exists else '不存在'} | 综述: {'存在' if overview_exists else '不存在'}")
     print(f"\n--- 文件内容（前 {CONTENT_PREVIEW_CHARS} 字符）---\n{md_content[:CONTENT_PREVIEW_CHARS]}")
     if len(md_content) > CONTENT_PREVIEW_CHARS:
-        print(f"\n[截断] 文件共 {len(md_content)} 字符，已显示前 {CONTENT_PREVIEW_CHARS} 字符。如需完整内容请用文件读取工具直接读取 {rel}")
+        print(f"\n[截断] 文件共 {len(md_content)} 字符，已显示前 {CONTENT_PREVIEW_CHARS} 字符。"
+              f"如需完整内容请用文件读取工具直接读取 {rel}")
     print("---")
 
     if discuss_mode:
         print(
             f"\n[DISCUSS 模式] {file_path.stem}\n"
             f"请与研究者讨论关键要点，确认后执行词条写入，然后调用：\n"
-            f"  python -m Tools.ingest --finalize <slug> <title> \"{rel}\""
-            f" --brief \"<一句话摘要>\"{finalize_standalone_flag}\n"
+            f"  python -m Tools.ingest --finalize <slug> <title> \"{rel}\" --brief \"<一句话摘要>\"\n"
         )
         return 0
 
@@ -1653,59 +1431,73 @@ def ingest_file(
         f"3. 确认所有 [[双链]] 指向已存在页面（断链需同步新建桩页）\n"
         f"4. 确定 slug（词条中文文件名去后缀）、title（显示标题）、brief（≤30字摘要）\n"
         f"5. 词条全部写入后，执行：\n"
-        f"   python -m Tools.ingest --finalize <slug> <title> \"{rel}\""
-        f" --brief \"<brief>\"{finalize_standalone_flag}\n"
+        f"   python -m Tools.ingest --finalize <slug> <title> \"{rel}\" --brief \"<brief>\"\n"
         f"\n   若需跳过本文件（无法处理），执行：\n"
         f"   python -m Tools.ingest --skip \"{rel}\"\n"
     )
     return 0
 
 
-# ─────────────────────────────────────────────
-# 队列辅助
-# ─────────────────────────────────────────────
-def _remove_from_queue(rel: str, skip: bool = False) -> None:
-    """从队列的 pending 列表移除指定文件（可选标记为 skipped）。"""
-    queue_data = _read_queue()
-    if queue_data is None:
-        return
-    pending = queue_data.get("pending", [])
-    if rel in pending:
-        pending.remove(rel)
-        if skip:
-            queue_data.setdefault("skipped", []).append(rel)
-        queue_data["pending"] = pending
-        _write_queue(queue_data)
+# ──────────────────────────────────────────────
+# --skip / --finalize 回传
+# ──────────────────────────────────────────────
 
-
-# ─────────────────────────────────────────────
-# --skip：跳过文件并推进队列
-# ─────────────────────────────────────────────
 def run_skip(raw_rel: str) -> int:
-    """跳过指定文件：从队列移除，记录 ERROR 日志，输出 [CONTINUE]/[STOP] 信号。"""
     normalized = normalize_path_str(raw_rel)
-    _remove_from_queue(normalized, skip=True)
     _write_error_log(f"ingest | {Path(raw_rel).name}", "用户主动跳过")
     print(f"INFO: 已跳过 {normalized}")
-    _advance_queue(normalized, standalone=False)
+    _skip_and_advance(normalized)
     return 0
 
 
-# ─────────────────────────────────────────────
-# --finalize：Agent 完成词条写入后回传
-# ─────────────────────────────────────────────
-def run_finalize(
-    slug: str,
-    title: str,
-    raw_rel: str,
-    standalone: bool = False,
-    brief: str = "",
-) -> int:
-    """Agent 完成词条写入后调用，负责日志、索引、Git 提交、qmd 更新和队列推进。"""
+def _update_index(slug: str, subdir: str, title: str, brief: str = "") -> None:
+    if not INDEX_FILE.exists():
+        return
+    content = read_file(INDEX_FILE)
+    section_map = {
+        "concepts":        "## Concepts",
+        "entities":        "## Entities",
+        "sources":         "## Sources",
+        "syntheses":       "## Syntheses",
+        "disambiguations": "## Disambiguations",
+    }
+    section_header = section_map.get(subdir)
+    if not section_header or f"({subdir}/{slug}.md)" in content:
+        return
+    if section_header not in content:
+        return
+
+    brief_part = f" -- {brief.strip()}" if brief and brief.strip() else ""
+    link_line  = f"- [{title}]({subdir}/{slug}.md){brief_part}\n"
+
+    section_start = content.index(section_header)
+    insert_from   = section_start + len(section_header)
+    next_section  = content.find("\n## ", insert_from)
+
+    if next_section == -1:
+        content = content.rstrip("\n") + "\n" + link_line
+    else:
+        block_before = content[:next_section].rstrip("\n")
+        block_after  = content[next_section + 1:]
+        content = block_before + "\n" + link_line + "\n" + block_after
+
+    write_file(INDEX_FILE, content)
+
+
+def _write_ingest_log(title: str, raw_rel: str, file_hash: str, slug: str) -> None:
+    today = date.today().isoformat()
+    entry = (
+        f"## [{today}] ingest | {title} | [[{raw_rel}]] "
+        f"| sha256:{file_hash} | slug:{slug}"
+    )
+    append_log(entry)
+
+
+def run_finalize(slug: str, title: str, raw_rel: str, brief: str = "") -> int:
+    # 找词条所在子目录
     subdir: Optional[str] = None
     for d in ("sources", "entities", "concepts", "disambiguations", "syntheses"):
-        candidate = WIKI_DIR / d / f"{slug}.md"
-        if candidate.exists():
+        if (WIKI_DIR / d / f"{slug}.md").exists():
             subdir = d
             break
     if subdir is None:
@@ -1717,25 +1509,23 @@ def run_finalize(
         print(f"WARN: 原始文件不存在: {raw_rel}")
         return 1
 
-    file_hash = sha256_file(raw_path)
-
-    if not standalone:
-        standalone = _consume_standalone_flag(raw_path)
-
+    file_hash      = sha256_file(raw_path)
     normalized_rel = normalize_path_str(raw_rel)
-    log_index       = _load_log_index()
+    log_index      = _load_log_index()
     already_current = (normalized_rel in log_index and log_index[normalized_rel] == file_hash)
 
     if already_current:
-        print(f"INFO: {raw_rel} 已摄入且哈希未变，跳过日志/index 更新（词条本身的修改已由 Agent 完成）。")
+        print(f"INFO: {raw_rel} 已摄入且哈希未变，跳过日志/index 更新。")
     else:
         if normalized_rel not in log_index:
-            conflict, existing_src = check_slug_conflict(slug, subdir, "ingest", raw_rel=normalized_rel)
+            conflict, existing_src = check_slug_conflict(
+                slug, subdir, "ingest", raw_rel=normalized_rel
+            )
             existing_file = WIKI_DIR / subdir / f"{slug}.md"
             if conflict and not existing_file.exists():
                 print(
                     f"[NEEDS_REVIEW] Slug 冲突：{subdir}/{slug}.md 已被其他来源占用（{existing_src}）。\n"
-                    f"请为本词条指定新的 slug，或确认覆盖（若两篇文件属同一主题的不同版本）。"
+                    f"请为本词条指定新的 slug。"
                 )
                 return 2
 
@@ -1745,58 +1535,50 @@ def run_finalize(
         qmd_embed_wiki()
         print(f"OK: 摄入完成：{title}（slug: {slug}，存入 Wiki/{subdir}/）")
 
-    _advance_queue(normalized_rel, standalone)
+    _advance_queue(normalized_rel)
     return 0
 
 
-# ─────────────────────────────────────────────
-# CLI 入口
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────
+# main()：统一入口，两种模式
+# ──────────────────────────────────────────────
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="LLM Wiki 摄入工具 v1.0",
+        description="LLM Wiki 摄入工具 v2.0",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""
-工作原理：Agent 是循环控制器，脚本是循环体。
-  脚本每次只处理一个文件，--finalize 后输出 [CONTINUE] <完整命令> 或 [STOP]。
-  Agent 必须将 [CONTINUE] 后的命令原样执行，不得等待用户确认。
+两种模式，无论指定多少文件，超过 {DEFAULT_BATCH_SIZE} 个均自动截断为一批：
 
-默认批次大小：{DEFAULT_BATCH_SIZE}（修改请同步更新 AGENTS.md §四触发表）
+  批处理模式（默认）：
+    python -m Tools.ingest                    # 扫描全库，取一批（{DEFAULT_BATCH_SIZE}个）
+    python -m Tools.ingest Raw/Sources/A.pdf  # 指定单个文件
+    python -m Tools.ingest Raw/Sources/       # 指定目录，自动递归展开
+    python -m Tools.ingest A.pdf B.md C.pdf   # 指定多个文件
+    python -m Tools.ingest --force <文件>     # 强制摄入超大文件
 
-使用示例：
-  python -m Tools.ingest                                # 扫描一批（默认{DEFAULT_BATCH_SIZE}个）并处理第一个
-  python -m Tools.ingest --all                          # 扫描全库并处理第一个
-  python -m Tools.ingest Raw/Sources/A.pdf B.pdf        # 指定文件队列，处理第一个
-  python -m Tools.ingest Raw/Sources/某论文.pdf          # 处理单个文件（可能属于已有队列）
-  python -m Tools.ingest Raw/Sources/某论文.pdf --force  # 强制摄入超大文件
-  python -m Tools.ingest Raw/Sources/某论文.pdf --standalone  # 独立摄入，不影响批次
-  python -m Tools.ingest --finalize 标题slug 显示标题 Raw/Sources/某论文.pdf --brief "摘要"
-  python -m Tools.ingest --skip Raw/Sources/无法处理的文件.pdf
+  单篇讨论模式（逐篇暂停等研究者确认）：
+    python -m Tools.ingest --discuss
+    python -m Tools.ingest Raw/Sources/ --discuss
+
+  完成词条写入后回传：
+    python -m Tools.ingest --finalize <slug> <title> <raw_rel> [--brief "摘要"]
+
+  跳过无法处理的文件：
+    python -m Tools.ingest --skip <raw_rel>
 """,
     )
     parser.add_argument(
-        "files", nargs="*",
-        help="要摄入的文件路径（可指定多个；无参数时等同于 --scan）",
-    )
-    parser.add_argument(
-        "--all", action="store_true",
-        help="扫描全库待摄入文件建立队列，并立即处理第一个",
-    )
-    parser.add_argument(
-        "--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
-        help=f"裸 ingest 每批处理数量，默认 {DEFAULT_BATCH_SIZE}",
+        "targets", nargs="*",
+        help="文件或目录路径（可混合；省略时扫描全库）",
     )
     parser.add_argument(
         "--discuss", action="store_true",
-        help="启用单篇讨论模式（每个文件处理后暂停等待讨论）",
+        help="单篇讨论模式：每个文件处理后暂停等待研究者确认",
     )
     parser.add_argument(
         "--force", action="store_true",
         help="强制摄入超大文件（跳过大小检查）",
-    )
-    parser.add_argument(
-        "--standalone", action="store_true",
-        help="本次摄入不参与任何批次进度（临时处理文件用）",
     )
     parser.add_argument(
         "--finalize", nargs=3,
@@ -1809,58 +1591,36 @@ def main() -> int:
     )
     parser.add_argument(
         "--skip", metavar="RAW_REL",
-        help="跳过指定文件（文件无法处理时使用），从队列移除并推进批次",
+        help="跳过指定文件并推进批次",
     )
 
     args = parser.parse_args()
 
+    # ── 回传命令，不走批次逻辑 ──
     if args.skip:
         return run_skip(args.skip)
 
     if args.finalize:
         slug, title, raw_rel = args.finalize
-        return run_finalize(slug, title, raw_rel, standalone=args.standalone, brief=args.brief)
+        return run_finalize(slug, title, raw_rel, brief=args.brief)
 
-    if args.all:
-        first = scan_pending(full=True)
-        if first is None:
+    # ── 确定候选文件列表 ──
+    if args.targets:
+        candidates = _collect_candidates_from_args(args.targets)
+        if not candidates and not _queue_has_pending():
+            print("OK: 指定路径下无需摄入或更新的文件。")
             return 0
-        return ingest_file(
-            REPO_ROOT / first,
-            discuss_mode=args.discuss,
-            standalone=args.standalone,
-            force=args.force,
-        )
+    else:
+        candidates = _collect_all_pending()
 
-    if len(args.files) > 1:
-        normalized = build_explicit_queue(args.files)
-        if not normalized:
-            return 1
-        first = normalized[0]
-        return ingest_file(
-            REPO_ROOT / first,
-            discuss_mode=args.discuss,
-            standalone=args.standalone,
-            force=args.force,
-        )
-
-    if len(args.files) == 1:
-        file_path = Path(args.files[0])
-        return ingest_file(
-            file_path,
-            discuss_mode=args.discuss,
-            standalone=args.standalone,
-            force=args.force,
-        )
-
-    # 裸 ingest（无文件、无 --all）：扫描一批，处理第一个
-    first = scan_pending(batch_size=args.batch_size, full=False)
+    # ── 建立（或恢复）批次，取第一个文件 ──
+    first = scan_and_build_queue(candidates)
     if first is None:
         return 0
+
     return ingest_file(
         REPO_ROOT / first,
         discuss_mode=args.discuss,
-        standalone=args.standalone,
         force=args.force,
     )
 
@@ -1875,10 +1635,6 @@ if __name__ == "__main__":
 
 ```python
 #!/usr/bin/env python3
-"""
-运行方式：python -m Tools.lint [--save] [--apply-annotation-check <file>] [--apply-blind-spots <file>]
-退出码：0 = 无严重问题，1 = 发现严重问题，2 = LLM 推理待处理（需重跑）
-"""
 
 import argparse
 import json
@@ -1913,7 +1669,6 @@ def _get_last_ingest_date(raw_rel: str) -> str:
 
 
 def check_orphan_pages() -> list:
-    """孤儿页检查（豁免 sources/ 和 syntheses/）。"""
     pages = list(all_wiki_pages())
     inbound: set = set()
     excluded_stems = WIKI_ROOT_SPECIAL_STEMS
@@ -2003,10 +1758,6 @@ def check_sparse_pages() -> list:
 def check_annotation_missing(pages_with_sources: list,
                              apply_answer_file: str = "",
                              apply_answer_text: str = "") -> Tuple[str, bool]:
-    """
-    检查所有来自需加注目录的词条，逐一检查各来源目录的加注合规性。
-    支持通过文件或命令行参数回传 LLM 推理结果。
-    """
     try:
         allowed = load_allowed_raw_dirs()
     except (FileNotFoundError, ValueError) as e:
@@ -2039,7 +1790,6 @@ def check_annotation_missing(pages_with_sources: list,
     if not entries:
         return "加注缺失：无需检查（无来自需要加注目录的词条）。", False
 
-    # 优先读取回传文件
     result_text = ""
     if apply_answer_file:
         p = Path(apply_answer_file)
@@ -2049,18 +1799,15 @@ def check_annotation_missing(pages_with_sources: list,
         result_text = apply_answer_text.strip()
 
     if result_text:
-        # 将结果写入固定文件供后续重跑使用
         write_file(ANNOTATION_RESULT_FILE, result_text)
         return f"加注缺失检查结果：\n{result_text}", False
 
-    # 检查固定结果文件是否比 context 新
     if ANNOTATION_RESULT_FILE.exists():
         ctx_mtime = SEMANTIC_CONTEXT.stat().st_mtime if SEMANTIC_CONTEXT.exists() else 0
         if ANNOTATION_RESULT_FILE.stat().st_mtime >= ctx_mtime:
             result_text = read_file(ANNOTATION_RESULT_FILE).strip()
             return f"加注缺失检查结果（缓存）：\n{result_text}", False
 
-    # 未找到已缓存结果，生成语义上下文并请求 LLM
     context_lines = [
         "# 加注缺失语义检查上下文\n\n",
         "请 Agent 读取以下词条，检查正文中他人观点/推论/主观内容是否已正确加注。\n\n"
@@ -2090,13 +1837,11 @@ def check_annotation_missing(pages_with_sources: list,
             f"然后重新运行 `python -m Tools.lint` 以完成审计。"
         ), True
 
-    # 自动缓存
     write_file(ANNOTATION_RESULT_FILE, result)
     return f"加注缺失检查结果：\n{result}", False
 
 
 def check_slug_conflicts() -> list:
-    """检查同一 slug 是否对应多个不同的 raw_rel（真正的冲突），排除同一文件重复摄入的正常情况。"""
     if not LOG_FILE.exists():
         return []
     log_text = read_file(LOG_FILE)
@@ -2116,7 +1861,6 @@ def check_blind_spots(apply_answer_file: str = "", apply_answer_text: str = "") 
     if not INDEX_FILE.exists():
         return "知识盲区：index.md 不存在，跳过分析。", False
 
-    # 优先回传
     result_text = ""
     if apply_answer_file:
         p = Path(apply_answer_file)
@@ -2130,7 +1874,6 @@ def check_blind_spots(apply_answer_file: str = "", apply_answer_text: str = "") 
         return f"知识盲区推荐：\n{result_text}", False
 
     if BLIND_SPOT_RESULT_FILE.exists():
-        # 比较 index.md 修改时间
         idx_mtime = INDEX_FILE.stat().st_mtime
         if BLIND_SPOT_RESULT_FILE.stat().st_mtime >= idx_mtime:
             result_text = read_file(BLIND_SPOT_RESULT_FILE).strip()
@@ -3077,8 +2820,8 @@ python -m Tools.health
 - `git log --oneline`
 - 下一步操作提示：
   > 1. 把他人文档放进 `Raw/Sources/`，自己的笔记放进 `Raw/Thoughts/`，个人记录放进 `Raw/Records/`
-  > 2. 在 AI 会话中说 `ingest`（处理一批，默认 5 个）、`ingest --all`（处理全部）或 `ingest <文件名> ...`（仅处理指定文件）；临时处理使用 `--standalone`
-  > 3. 说 `ingest --discuss` 切换为单篇讨论模式；完成词条写入后执行 `python -m Tools.ingest --finalize <slug> <title> <文件路径>`
+  > 2. 在 AI 会话中说 `ingest`（处理一批，默认 5 个）或 `ingest <文件或目录>`（指定范围，超过 5 个自动截断）
+  > 3. 说 `ingest --discuss` 切换为单篇讨论模式；完成词条写入后执行 `python -m Tools.ingest --finalize <slug> <title> <文件路径> [--brief "<摘要>"]`
   > 4. 说 `query: <问题>` 触发查询；归档时使用 `--save --slug <slug>`；若 Agent 推理待处理，使用 `--apply --slug <slug> --answer "<答案>"` 并建议同时提供原始问题文本
   > 5. 说 `health` 检查仓库健康状态（每次会话必跑）；若 qmd 集合未初始化，运行 `qmd init --collection wiki Wiki/` 和 `qmd init --collection raw Raw/`
   > 6. 若目录树中出现 `Graph/.infer-*.json` 等文件，属于单次推理会话的临时中转文件，无需保留（已被 `.gitignore` 排除）。
@@ -3122,13 +2865,10 @@ python -m Tools.health
 
 | 指令 | 触发工作流 | 对应命令 | 说明 |
 |------|-----------|---------|------|
-| `ingest`（无文件） | 分批摄入 | `python -m Tools.ingest` | 详见 §四 |
-| `ingest --all` | 全库摄入 | `python -m Tools.ingest --all` | 详见 §四 |
-| `ingest <file1> <file2> ...` | 指定文件摄入 | `python -m Tools.ingest <文件列表>` | 详见 §四 |
-| `ingest <file>` | 摄入单个指定文件 | `python -m Tools.ingest <路径>` | 详见 §四 |
-| `ingest --standalone <file>` | 独立摄入 | `python -m Tools.ingest <file> --standalone` | 详见 §四 |
-| `ingest --discuss <file...>` | 单篇讨论模式 | `python -m Tools.ingest <路径> --discuss` | 详见 §四 |
-| `ingest --finalize <slug> <title> <file> [--standalone]` | 摄入完成回传 | `python -m Tools.ingest --finalize <slug> <title> <路径> [--standalone]` | 词条写入完成后恢复摄入流程 |
+| `ingest` | 批处理摄入（扫描全库） | `python -m Tools.ingest` | 超过5个自动截断，详见 §四 |
+| `ingest <文件或目录> [...]` | 批处理摄入（指定范围） | `python -m Tools.ingest <路径> [路径...]` | 支持文件、目录混合，超过5个自动截断，详见 §四 |
+| `ingest --discuss [文件或目录]` | 单篇讨论模式 | `python -m Tools.ingest [路径...] --discuss` | 每篇处理后暂停等研究者确认，详见 §四 |
+| `ingest --finalize <slug> <title> <file>` | 摄入完成回传 | `python -m Tools.ingest --finalize <slug> <title> <路径>` | 词条写入完成后推进批次 |
 | `query: <问题>` | 查询工作流 | `python -m Tools.query "<问题>"` | 先查 Wiki，盲区回退至 Raw |
 | `query: <问题> --save --slug <slug>` | 查询并归档 | `python -m Tools.query "<问题>" --save --slug <slug>` | 触发答案生成后自动保存为综述 |
 | `query --apply --slug <slug> --answer "<答案>"` | 完成归档 | `python -m Tools.query "<问题>" --apply --slug <slug> --answer "<答案>"` | Agent 完成 LLM 推理后继续保存（建议带上原始问题文本） |
@@ -3343,31 +3083,28 @@ last_updated: YYYY-MM-DD
 
 **触发与范围判定**：
 
-| 用户指令 | 队列范围 | 停止时机 |
-|---------|---------|---------|
-| `ingest`（无文件） | 取一批（默认 5 个）待摄入文件 | 本批次处理完即停，不自动扫下一批 |
-| `ingest --all` | 取全库待摄入文件 | 全库处理完才停 |
-| `ingest <文件A> <文件B> ...` | 临时队列，仅含指定文件 | 处理完这些指定文件即停 |
-| `ingest <单个文件>` | 若该文件在某个现有队列的 pending 中，沿用该队列继续推进；否则视为独立处理 | 不在队列中时，处理该文件后即停 |
-| `ingest --discuss <文件...>` | 队列范围判定逻辑不变，discuss 仅影响单文件处理时是否暂停讨论 | 每个文件处理后暂停等待讨论 |
-| `ingest --standalone <文件>` | 完全脱离队列 | 处理该文件后即停，不影响任何队列 |
+| 用户指令 | 候选文件范围 | 批次大小 | 停止时机 |
+|---------|------------|---------|---------|
+| `ingest` | 全库 Raw/ 中所有待摄入/已修改文件 | 最多 DEFAULT_BATCH_SIZE（5）个 | 本批次处理完即停，不自动扫下一批 |
+| `ingest <文件或目录> [...]` | 仅限指定路径（目录递归展开） | 同上，超过5个自动截断 | 本批次处理完即停 |
+| `ingest [路径...] --discuss` | 与对应无 `--discuss` 版本相同 | 同上 | 每个文件处理后暂停等研究者确认 |
+
+> **【目录意图识别规则】**：当用户说"处理 Sources 下所有文件"或给出目录路径时，Agent 将目录路径直接作为参数传入 `python -m Tools.ingest <目录路径>`，**严禁**手动展开目录为文件列表拼接到命令行。目录展开和批次截断完全由脚本内部统一处理。
 
 **核心步骤**：
 
 1. 根据上表判定本次队列范围
-2. 对队列中每个文件调用 `python -m Tools.ingest <路径>`（或 `--discuss` / `--standalone`）
+2. 对队列中每个文件调用 `python -m Tools.ingest <路径>`（或 `--discuss`）
 3. 脚本输出文件内容（前 4000 字符）及上下文信息
 4. Agent 读取输出，写入/更新对应 Wiki 词条
-5. 词条写入完成后，Agent 调用 `python -m Tools.ingest --finalize <slug> <title> <路径> [--standalone]`
+5. 词条写入完成后，Agent 调用 `python -m Tools.ingest --finalize <slug> <title> <路径> [--brief "<摘要>"]`
 6. 脚本自动完成 index.md 更新、日志追加、Git 提交、qmd 索引更新，并更新批次清单，输出停止或继续信号。**若文件哈希未变（仅词条内容被 Agent 手动调整），脚本跳过 index/log/git/qmd 更新，仅推进批次进度。**
 
-**【去重判断依据】**：由 `ingest --scan` 自动完成路径与 SHA-256 哈希的比对，Agent 无需手动计算。
+**【去重判断依据】**：由 ingest 自动完成路径与 SHA-256 哈希的比对，Agent 无需手动计算。
 
 **【支持格式】**：`.md` 直接摄入；`.pdf`、`.docx`、`.pptx`、`.xlsx`、`.html`、`.txt`、`.epub` 等通过 markitdown 自动转换后摄入。
 
-**【`--standalone` 标志说明】**：当用户明确要求临时处理某个文件而不影响任何批次时，Agent **必须**使用 `--standalone`。该标志会在 `ingest_file` 阶段创建一个持久化标记文件（`.llm-wiki/.standalone-<可读路径>.flag`）。标记文件**仅基于文件路径**生成，因此即使 Raw 文件在 `ingest_file` 和 `--finalize` 之间被修改，standalone 意图也不会丢失。
-
-**【调用前检查】**：Agent 在调用 `python -m Tools.ingest <file>`（不带 `--standalone`）之前，若 `.llm-wiki/ingest-queue.json` 存在，应先检查该文件路径是否在 `pending` 列表中。若在，且用户当前措辞是"看一下"、"先不正式处理"等探索性语言而非"处理"、"摄入"等确定性语言，Agent 应主动加上 `--standalone`，避免脚本将本次调用误判为批次推进的一部分。
+**【调用前检查】**：Agent 在调用 `python -m Tools.ingest` 之前，若 `.llm-wiki/ingest-queue.json` 存在且 `pending` 列表非空，说明有未完成批次。此时脚本会自动检测并提示继续，Agent 直接执行 `python -m Tools.ingest` 即可恢复上次批次，无需任何额外参数。
 
 **【overview.md 强制更新规则】**：每次 ingest 批次完成后，Agent **必须**检查并实质性更新 `Wiki/overview.md`，至少替换掉 `## 当前研究焦点` 节的占位注释 `<!-- ... -->`，写入本次摄入涉及的核心主题与领域。其他三个 section 也应在有足够信息时更新。`health` 命令会检测所有仍为占位的 section 并报告。
 
@@ -3375,7 +3112,7 @@ last_updated: YYYY-MM-DD
 
 每完成一个文件的 `--finalize`，脚本会在末尾输出以下之一：
 
-- `[CONTINUE] 立即执行：<完整命令>` → Agent **必须**立即将该命令原样执行，不得添加任何前置判断或等待用户确认。这是批量流程的唯一驱动机制。
+- `[CONTINUE] 立即执行：python -m Tools.ingest` → Agent **必须**立即执行此命令，脚本自动从 `.llm-wiki/ingest-queue.json` 读取下一个待处理文件，无需任何额外参数。这是批量流程的唯一驱动机制。
 - `[STOP] <原因说明>` → 停止，不再继续处理任何文件
 
 以脚本输出信号为准，无需额外判断。**`[STOP]` 后即便全库仍有待摄入文件，也不主动继续**，除非用户再次触发。
@@ -3514,7 +3251,6 @@ last_updated: YYYY-MM-DD
 | 图谱缓存 | `Graph/.cache.json` | .gitignore 屏蔽 |
 | 查询 pending 文件 | `.qmd-pending-query.json` | .gitignore 屏蔽 |
 | 摄入批次清单 | `.llm-wiki/ingest-queue.json` | .gitignore 屏蔽（运行时临时状态） |
-| standalone 标记文件 | `.llm-wiki/.standalone-*.flag` | .gitignore 屏蔽（临时意图传递，可读路径） |
 | 工具中间输出 | `Tools/__pycache__/`、`*.pyc` | .gitignore 屏蔽 |
 | 检索索引目录 | `.qmd/` | .gitignore 屏蔽 |
 | Obsidian 配置 | `.obsidian/`、`workspace.json` | .gitignore 屏蔽 |
