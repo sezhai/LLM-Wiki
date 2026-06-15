@@ -1029,6 +1029,64 @@ SUPPORTED_EXTS = {".md", ".txt", ".pdf", ".docx", ".pptx", ".xlsx", ".html", ".e
 
 
 # ──────────────────────────────────────────────
+# 候选文件自然排序（中文卷号排序支持）
+# ──────────────────────────────────────────────
+
+_CHN_DIGIT = dict(zip('零一二三四五六七八九', range(10)))
+
+def _chn_num_to_int(s: str) -> int:
+    """将中文数词串（如'二十五'、'十二'）转为整数。"""
+    if not s:
+        return 0
+    n, cur = 0, 0
+    for ch in s:
+        if ch in _CHN_DIGIT:
+            cur = _CHN_DIGIT[ch]
+        elif ch == '十':
+            n += cur * 10 if cur else 10
+            cur = 0
+        elif ch == '百':
+            n += (cur or 1) * 100
+            cur = 0
+        elif ch == '千':
+            n += (cur or 1) * 1000
+            cur = 0
+    return n + cur
+
+
+def _candidate_sort_key(f: Path) -> tuple:
+    """
+    按真实文件名（去掉 Sliced_ 前缀）排序：
+    - 前言总在最前
+    - 中文数字卷号 → 转三位阿拉伯数字（如 十二→012）
+    - 其余按原串
+    """
+    name = f.stem
+    if name.startswith('Sliced_'):
+        name = name[7:]
+
+    # 前言 → 总是第一个
+    if '前言' in name:
+        return (0, '')
+    # 中文数词(后接、) → 提取卷号并按数值排序
+    # 同时匹配卷第N（如"卷第二下"）
+    m = re.search(r'([' + ''.join(_CHN_DIGIT) + '十百千]+)、', name)
+    if m:
+        vol = _chn_num_to_int(m.group(1))
+        return (1, f'{vol:04d}{name}')
+    m = re.search(r'卷第第?([' + ''.join(_CHN_DIGIT) + '十百千]+)', name)
+    if m:
+        vol = _chn_num_to_int(m.group(1))
+        return (1, f'{vol:04d}{name}')
+    # 阿拉伯数字开头
+    m = re.match(r'(\d+)', name)
+    if m:
+        return (2, f'{int(m.group(1)):04d}{name}')
+    # 其余
+    return (3, name)
+
+
+# ──────────────────────────────────────────────
 # 日志索引（哈希去重基础）
 # ──────────────────────────────────────────────
 
@@ -1047,7 +1105,11 @@ def _load_log_index() -> Dict[str, str]:
 # ──────────────────────────────────────────────
 
 def _collect_candidates_from_args(targets: List[str]) -> List[str]:
-
+    """
+    将用户传入的文件/目录参数展开为规范化相对路径列表。
+    目录递归展开；已在日志中且哈希未变的文件自动跳过。
+    返回列表已去重、已排序。
+    """
     log_index = _load_log_index()
     seen = set()
     result = []
@@ -1066,8 +1128,9 @@ def _collect_candidates_from_args(targets: List[str]) -> List[str]:
                 continue
 
         if p.is_dir():
-            files = sorted(f for f in p.rglob("*")
-                           if f.is_file() and f.suffix.lower() in SUPPORTED_EXTS)
+            files = sorted((f for f in p.rglob("*")
+                            if f.is_file() and f.suffix.lower() in SUPPORTED_EXTS),
+                           key=_candidate_sort_key)
         elif p.is_file():
             files = [p]
         else:
@@ -1106,7 +1169,7 @@ def _collect_all_pending() -> List[str]:
         dir_path = RAW_DIR / dir_name
         if not dir_path.exists():
             continue
-        for f in sorted(dir_path.rglob("*")):
+        for f in sorted(dir_path.rglob("*"), key=_candidate_sort_key):
             if not f.is_file() or f.suffix.lower() not in SUPPORTED_EXTS:
                 continue
             rel = normalize_path_str(f.relative_to(REPO_ROOT).as_posix())
@@ -1182,26 +1245,47 @@ def scan_and_build_queue(candidates: List[str]) -> Optional[str]:
     return batch[0]
 
 
-def _advance_queue(raw_rel: str) -> None:
-    """将 raw_rel 从 pending 移入 done，并处理 skip→finalize 的补做路径。"""
+def _advance_queue(raw_rel: str, subdir: str = "", slug: str = "",
+                   title: str = "", force: bool = False) -> int:
+    """将 raw_rel 从 pending 移入 done。批次完成时触发概念/实体强约束检查。
+    返回 0 成功，2 概念检查失败（批次阻断，Agent 创建概念页后重试）。
+    """
     queue_data = _read_queue()
     if queue_data is None:
         print("[STOP] 无批次清单。")
-        return
+        return 0
 
-    pending = queue_data.get("pending", [])
-    done    = queue_data.get("done", [])
-    skipped = queue_data.get("skipped", [])
+    pending       = queue_data.get("pending", [])
+    done          = queue_data.get("done", [])
+    skipped       = queue_data.get("skipped", [])
+    batch_src_cnt = queue_data.get("batch_source_map_count", 0)
+    concept_ok    = queue_data.get("concept_checked", False)
 
+    # ── 重复 finalize（幂等，Agent 创建概念后或使用 --force 重试走此路）──
     if raw_rel in done:
-        # 重复 finalize（幂等）
-        if pending:
-            print(f"[CONTINUE] 立即执行：python -m Tools.ingest")
+        if not pending and batch_src_cnt > 0 and not concept_ok:
+            if force or _check_batch_concept_requirement(done):
+                queue_data["concept_checked"] = True
+                _write_queue(queue_data)
+                if INGEST_QUEUE_FILE.exists():
+                    INGEST_QUEUE_FILE.unlink()
+                print(f"\nOK: 批次完成（{len(done)}/{len(done)}）。")
+                print("[STOP] 批次已全部完成。")
+            else:
+                print(
+                    f"[NEEDS_REVIEW] 本批次已创建 {batch_src_cnt} 条 source_map 但未关联任何 concept/entity 词条。\n"
+                    f"请在 Wiki/concepts/ 或 Wiki/entities/ 下创建至少一个引用本批次来源的\n"
+                    f"词条后重新执行 --finalize。"
+                )
+                return 2
         else:
-            print("[STOP] 批次已全部完成。")
-        return
+            if pending:
+                print(f"[CONTINUE] 立即执行：python -m Tools.ingest")
+            else:
+                print("[STOP] 批次已全部完成。")
+        return 0
 
-    # 修复 skip→finalize 路径：若文件曾被跳过，现补做完成，则从 skipped 移至 done
+    # ── 修复 skip→finalize 路径 ──
     if raw_rel in skipped:
         skipped.remove(raw_rel)
         done.append(raw_rel)
@@ -1213,22 +1297,58 @@ def _advance_queue(raw_rel: str) -> None:
             print(f"[CONTINUE] 立即执行：python -m Tools.ingest")
         else:
             print("[STOP] 批次已全部完成。")
-        return
+        return 0
 
     if raw_rel not in pending:
         print("[STOP] 该文件不属于当前批次。")
-        return
+        return 0
 
+    # ── 正常推进 ──
     pending.remove(raw_rel)
     done.append(raw_rel)
+    if subdir == "sources":
+        batch_src_cnt += 1
+
     queue_data["pending"] = pending
     queue_data["done"]    = done
-    _write_queue(queue_data)
+    queue_data["batch_source_map_count"] = batch_src_cnt
 
     remaining = len(pending)
     total     = queue_data.get("total", len(done) + remaining)
 
     if remaining == 0:
+        # 批次完成 → 若有 source_map 则检查概念/实体强约束
+        if batch_src_cnt > 0 and not concept_ok:
+            if force or _check_batch_concept_requirement(done):
+                queue_data["concept_checked"] = True
+                _write_queue(queue_data)
+                if INGEST_QUEUE_FILE.exists():
+                    INGEST_QUEUE_FILE.unlink()
+                print(f"\nOK: 批次完成（{len(done)}/{total}）。")
+                print("[STOP] 批次已全部完成。")
+                print(
+                    "\n>>> 批次后续建议："
+                    "\n    1. 请更新 Wiki/overview.md（当前研究焦点、跨领域联系等）"
+                    f"\n    2. 若本批次摄入 ≥3 个文件，建议运行：python -m Tools.lint"
+                )
+                return 0
+            # 阻断：将本文件退回 pending，等待 Agent 创建概念后重试
+            pending.append(raw_rel)
+            done.remove(raw_rel)
+            batch_src_cnt -= 1
+            queue_data["pending"] = pending
+            queue_data["done"]    = done
+            queue_data["batch_source_map_count"] = batch_src_cnt
+            _write_queue(queue_data)
+            print(
+                f"[NEEDS_REVIEW] 本批次已创建 {batch_src_cnt + 1} 条 source_map "
+                f"但未关联任何 concept/entity 词条。\n"
+                f"请在 Wiki/concepts/ 或 Wiki/entities/ 下创建至少一个引用本批次来源的\n"
+                f"词条后重新执行 --finalize，或使用 --force 跳过此检查。"
+            )
+            return 2
+        # 无 source_map 或已检查通过
+        _write_queue(queue_data)
         if INGEST_QUEUE_FILE.exists():
             INGEST_QUEUE_FILE.unlink()
         print(f"\nOK: 批次完成（{len(done)}/{total}）。")
@@ -1239,8 +1359,11 @@ def _advance_queue(raw_rel: str) -> None:
             f"\n    2. 若本批次摄入 ≥3 个文件，建议运行：python -m Tools.lint"
         )
     else:
+        _write_queue(queue_data)
         print(f"\nINFO: 批次进度：{len(done)}/{total} 完成，剩余 {remaining} 个。")
         print(f"[CONTINUE] 立即执行：python -m Tools.ingest")
+
+    return 0
 
 
 def _skip_and_advance(raw_rel: str) -> None:
@@ -1493,7 +1616,25 @@ def _write_ingest_log(title: str, raw_rel: str, file_hash: str, slug: str) -> No
     append_log(entry)
 
 
-def run_finalize(slug: str, title: str, raw_rel: str, brief: str = "") -> int:
+def _check_batch_concept_requirement(raw_rels: List[str]) -> bool:
+    """检查是否有至少一个 concept/entity 页引用给定来源列表中的任意一个。"""
+    targets = {normalize_path_str(r) for r in raw_rels}
+    for page in all_wiki_pages():
+        p_str = str(page).replace("\\", "/")
+        if not ("/concepts/" in p_str or "/entities/" in p_str):
+            continue
+        content = read_file(page)
+        fm_match = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
+        if not fm_match:
+            continue
+        links = extract_wikilinks(fm_match.group(1))
+        if targets & {normalize_path_str(l) for l in links}:
+            return True
+    return False
+
+
+def run_finalize(slug: str, title: str, raw_rel: str, brief: str = "",
+                 force: bool = False) -> int:
     # 找词条所在子目录
     subdir: Optional[str] = None
     for d in ("sources", "entities", "concepts", "disambiguations", "syntheses"):
@@ -1535,8 +1676,7 @@ def run_finalize(slug: str, title: str, raw_rel: str, brief: str = "") -> int:
         qmd_embed_wiki()
         print(f"OK: 摄入完成：{title}（slug: {slug}，存入 Wiki/{subdir}/）")
 
-    _advance_queue(normalized_rel)
-    return 0
+    return _advance_queue(normalized_rel, subdir=subdir, slug=slug, title=title, force=force)
 
 
 # ──────────────────────────────────────────────
@@ -1561,8 +1701,9 @@ def main() -> int:
     python -m Tools.ingest --discuss
     python -m Tools.ingest Raw/Sources/ --discuss
 
-  完成词条写入后回传：
-    python -m Tools.ingest --finalize <slug> <title> <raw_rel> [--brief "摘要"]
+   完成词条写入后回传：
+      python -m Tools.ingest --finalize <slug> <title> <raw_rel> [--brief "摘要"] [--force]
+      强制跳过整批的 concept/entity 强约束检查（如纯数据表、日程等无概念性内容的批次）
 
   跳过无法处理的文件：
     python -m Tools.ingest --skip <raw_rel>
@@ -1602,7 +1743,7 @@ def main() -> int:
 
     if args.finalize:
         slug, title, raw_rel = args.finalize
-        return run_finalize(slug, title, raw_rel, brief=args.brief)
+        return run_finalize(slug, title, raw_rel, brief=args.brief, force=args.force)
 
     # ── 确定候选文件列表 ──
     if args.targets:
@@ -2835,13 +2976,9 @@ python -m Tools.health
 ```markdown
 # AGENTS.md（最高操作契约）
 
-<!-- version: v1.0 | created: <YYYY-MM-DD> | last_schema_updated: <YYYY-MM-DD> -->
+<!-- version: v1.0 | created: <YYYY-MM-DD> | last_schema_updated: 2026-06-15 -->
 
 本文件是 Agent 每次执行前**必读**的最高宪法。所有工作流、规则、模板均以本文件为唯一权威来源。
-
----
-
-| v1.0 | <YYYY-MM-DD> | 初始版本 | — | — |
 
 > **何时修订**：当某条规则反复产生不符合预期的结果，或某个工作流与实际使用习惯持续偏差时，与研究者讨论后修订。修订后更新上表（**必须填写"已知遗留问题"列**，若无则写"—"），并在 log.md 追加 `chore | AGENTS.md 修订 vX.X`。
 
@@ -2868,7 +3005,7 @@ python -m Tools.health
 | `ingest` | 批处理摄入（扫描全库） | `python -m Tools.ingest` | 超过5个自动截断，详见 §四 |
 | `ingest <文件或目录> [...]` | 批处理摄入（指定范围） | `python -m Tools.ingest <路径> [路径...]` | 支持文件、目录混合，超过5个自动截断，详见 §四 |
 | `ingest --discuss [文件或目录]` | 单篇讨论模式 | `python -m Tools.ingest [路径...] --discuss` | 每篇处理后暂停等研究者确认，详见 §四 |
-| `ingest --finalize <slug> <title> <file>` | 摄入完成回传 | `python -m Tools.ingest --finalize <slug> <title> <路径>` | 词条写入完成后推进批次 |
+| `ingest --finalize <slug> <title> <file> [--force]` | 摄入完成回传 | `python -m Tools.ingest --finalize <slug> <title> <路径> [--force]` | 词条写入完成后推进批次；若新建 source_map 未关联概念/实体页，批次结束时阻断返回 code 2，`--force` 跳过 |
 | `query: <问题>` | 查询工作流 | `python -m Tools.query "<问题>"` | 先查 Wiki，盲区回退至 Raw |
 | `query: <问题> --save --slug <slug>` | 查询并归档 | `python -m Tools.query "<问题>" --save --slug <slug>` | 触发答案生成后自动保存为综述 |
 | `query --apply --slug <slug> --answer "<答案>"` | 完成归档 | `python -m Tools.query "<问题>" --apply --slug <slug> --answer "<答案>"` | Agent 完成 LLM 推理后继续保存（建议带上原始问题文本） |
@@ -3096,9 +3233,10 @@ last_updated: YYYY-MM-DD
 1. 根据上表判定本次队列范围
 2. 对队列中每个文件调用 `python -m Tools.ingest <路径>`（或 `--discuss`）
 3. 脚本输出文件内容（前 4000 字符）及上下文信息
-4. Agent 读取输出，写入/更新对应 Wiki 词条
-5. 词条写入完成后，Agent 调用 `python -m Tools.ingest --finalize <slug> <title> <路径> [--brief "<摘要>"]`
+4. Agent 读取输出，为整批文件统一创建 Wiki 词条（source_map + concept/entity）
+5. 对队列中每个文件依次调用 `python -m Tools.ingest --finalize <slug> <title> <路径> [--brief "<摘要>"]`
 6. 脚本自动完成 index.md 更新、日志追加、Git 提交、qmd 索引更新，并更新批次清单，输出停止或继续信号。**若文件哈希未变（仅词条内容被 Agent 手动调整），脚本跳过 index/log/git/qmd 更新，仅推进批次进度。**
+7. **批次最后一文件 finalize 后**，脚本检查本批次是否创建了 source_map。若是但无任何 concept/entity 页引用本批来源，则阻断返回 exit code 2，队列回退该文件位置。Agent 创建对应概念/实体页后重新执行 `--finalize` 即可。若来源确实不含有概念性内容（如纯数据表、日程、个人记录），使用 `--force` 跳过。
 
 **【去重判断依据】**：由 ingest 自动完成路径与 SHA-256 哈希的比对，Agent 无需手动计算。
 
