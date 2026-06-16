@@ -531,6 +531,20 @@ def check_slug_conflict(
                         slug_raws.add(rec_raw)
                 if raw_rel in slug_raws:
                     continue
+            # 若文件已存在但尚无日志记录，检查其 frontmatter 是否引用此 raw_rel
+            if raw_rel:
+                content = read_file(target_path)
+                fm_match = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
+                if fm_match:
+                    fm_text = fm_match.group(1)
+                    # 检查 sources 数组字段
+                    sources_field = re.search(r"sources:\s*\[([^\]]*)\]", fm_text)
+                    if sources_field and normalize_path_str(raw_rel) in normalize_path_str(sources_field.group(1)):
+                        continue
+                    # 检查 raw_link 字段
+                    raw_link_field = re.search(r"raw_link:\s*['\"]?\[\[([^\]]*)\]\]", fm_text)
+                    if raw_link_field and normalize_path_str(raw_rel) == normalize_path_str(raw_link_field.group(1)):
+                        continue
             return True, target_path.relative_to(REPO_ROOT).as_posix()
 
     if LOG_FILE.exists() and raw_rel:
@@ -544,7 +558,7 @@ def check_slug_conflict(
     return False, None
 
 def parse_log_slugs(log_text: str) -> Dict[str, str]:
-    """[FIX] 修复 query-synthesis 行解析正则：`|` 改为 `\|`，避免误匹配其他日志行"""
+    """[FIX] 修复 query-synthesis 行解析正则：`|` 改为 r'\\|'，避免误匹配其他日志行"""
     result: Dict[str, str] = {}
     for _, _, _, slug in parse_ingest_records(log_text):
         result[slug] = "ingest"
@@ -1048,31 +1062,47 @@ def _chn_num_to_int(s: str) -> int:
             cur = 0
     return n + cur
 
+def _series_grp(name: str) -> str:
+    """
+    从文件名提取逻辑系列名。
+    取 Sliced_ 后第一个 _ 之前的内容为系列名。
+    例：西方哲学史纲要_现代哲学_part1 → 西方哲学史纲要
+        2014年读书摘录_前言 → 2014年读书摘录
+    """
+    if name.startswith('Sliced_'):
+        rest = name[7:]
+    else:
+        rest = name
+    m = re.match(r'^([^_]+)', rest)
+    if m:
+        return m.group(1)
+    return rest
+
 def _candidate_sort_key(f: Path) -> tuple:
     """
-    按真实文件名（去掉 Sliced_ 前缀）排序：
-    前言总在最前
-    中文数字卷号 → 转三位阿拉伯数字（如 十二→012）
-    其余按原串
+    按 系列→卷序 两级排序，确保同系列文件聚在一起。
+    前言在同系列内优先，但不跨系列全局抢占。
+    中文数字卷号 → 转四位阿拉伯数字。
     """
     name = f.stem
     if name.startswith('Sliced_'):
         name = name[7:]
+    series = _series_grp(name)
 
     if '前言' in name:
-        return (0, '')
+        return (series, 0, '')
     m = re.search(r'([' + ''.join(_CHN_DIGIT) + '十百千]+)、', name)
     if m:
         vol = _chn_num_to_int(m.group(1))
-        return (1, f'{vol:04d}{name}')
+        return (series, 1, f'{vol:04d}{name}')
     m = re.search(r'卷[第第]?([' + ''.join(_CHN_DIGIT) + '十百千]+)', name)
     if m:
         vol = _chn_num_to_int(m.group(1))
-        return (1, f'{vol:04d}{name}')
+        return (series, 1, f'{vol:04d}{name}')
     m = re.match(r'(\d+)', name)
     if m:
-        return (2, f'{int(m.group(1)):04d}{name}')
-    return (3, name)
+        return (series, 2, f'{int(m.group(1)):04d}{name}')
+    return (series, 3, name)
 
 # ──────────────────────────────────────────────
 # 日志索引（哈希去重基础）
@@ -1200,8 +1230,28 @@ def scan_and_build_queue(candidates: List[str]) -> Optional[str]:
         return None
 
     total_candidates = len(candidates)
-    batch = candidates[:DEFAULT_BATCH_SIZE]
-    remaining_after = total_candidates - len(batch)
+
+    # 按系列分组，取整组作为批次，避免跨系列文件混批
+    groups: Dict[str, List[str]] = {}
+    for c in candidates:
+        nc = normalize_path_str(c)
+        grp = _series_grp(Path(nc).stem)
+        groups.setdefault(grp, []).append(nc)
+    # 优先取候选数最多的系列；若不足 batch size 则从下一组补充
+    sorted_groups = sorted(groups.items(), key=lambda x: -len(x[1]))
+    batch: List[str] = []
+    for _, files in sorted_groups:
+        if not batch:
+            batch = files[:DEFAULT_BATCH_SIZE]
+        elif len(batch) < DEFAULT_BATCH_SIZE:
+            needed = DEFAULT_BATCH_SIZE - len(batch)
+            batch.extend(files[:needed])
+        else:
+            break
+    # 记录未进入本批次的候选（跨批次续批依据），路径需标准化
+    batch_set = set(batch)
+    candidates_norm = [normalize_path_str(c) for c in candidates]
+    remaining_candidates = [c for c in candidates_norm if c not in batch_set]
 
     queue_data = {
         "created": date.today().isoformat(),
@@ -1210,16 +1260,17 @@ def scan_and_build_queue(candidates: List[str]) -> Optional[str]:
         "pending": batch,
         "done": [],
         "skipped": [],
+        "remaining_candidates": remaining_candidates,
     }
     _write_queue(queue_data)
 
     print(f"INFO: 发现 {total_candidates} 个待摄入/已修改文件，本批次处理其中 {len(batch)} 个：")
     for i, p in enumerate(batch, 1):
         print(f"  {i}. {p}")
-    if remaining_after > 0:
+    if remaining_candidates:
         print(
-            f"\n提示：本批次（{len(batch)} 个）处理完后将停止。"
-            f"剩余 {remaining_after} 个文件，再次执行 ingest 处理下一批。"
+            f"\n提示：本批次（{len(batch)} 个）处理完后将自动继续下一批。"
+            f"剩余 {len(remaining_candidates)} 个文件。"
         )
     return batch[0]
 
@@ -1306,8 +1357,8 @@ def _advance_queue(raw_rel: str, subdir: str = "", slug: str = "",
     _write_queue(queue_data)
 
     print(
-        f"[NEEDS_REVIEW] 批次末尾 concept/entity 覆盖验证失败：\n"
-        "\n".join(f"  - {line}" for line in report)
+        f"[NEEDS_REVIEW] 批次末尾 concept/entity 覆盖验证失败：\n" +
+        "\n".join(f"  - {line}" for line in report) +
         f"\n\n请为以上 source_map 补充对应的 concept/entity 词条后，"
         f"重新执行 --finalize（或使用 --force 跳过验证）。"
     )
@@ -1383,13 +1434,30 @@ def _check_concept_coverage(
     return bool(missing), missing
 
 def _finalize_batch(queue_data: dict) -> None:
-    """清理队列文件，打印批次完成信息。"""
+    """清理队列文件，打印批次完成信息；若仍有未处理候选则自动续批。"""
+    done = queue_data.get("done", [])
+    skipped = queue_data.get("skipped", [])
+    total = queue_data.get("total", len(done))
+    remaining_candidates = queue_data.get("remaining_candidates", [])
+
+    print(f"\nOK: 批次完成（{len(done)}/{total}）。")
+
+    if remaining_candidates:
+        # 滤除已完成的文件（支持 skip 豁免）
+        still_pending = [
+            c for c in remaining_candidates
+            if c not in done and c not in skipped
+        ]
+        if still_pending:
+            INGEST_QUEUE_FILE.unlink(missing_ok=True)
+            print(f"INFO: 自动续批：剩余 {len(still_pending)} 个文件。\n")
+            scan_and_build_queue(still_pending)
+            print(f"\n[CONTINUE] 立即执行：python -m Tools.ingest")
+            return
+
     if INGEST_QUEUE_FILE.exists():
         INGEST_QUEUE_FILE.unlink()
-    done = queue_data.get("done", [])
-    total = queue_data.get("total", len(done))
-    print(f"\nOK: 批次完成（{len(done)}/{total}）。")
-    print("[STOP] 批次已全部完成。")
+    print("[STOP] 所有候选文件已全部完成。")
     print(
         "\n>>> 批次后续建议："
         "\n  1. 请更新 Wiki/overview.md（当前研究焦点、跨领域联系等）"
@@ -1437,8 +1505,8 @@ def _skip_and_advance(raw_rel: str) -> None:
             _finalize_batch(queue_data)
         else:
             print(
-                f"[NEEDS_REVIEW] 批次末尾 concept/entity 覆盖验证失败：\n"
-                "\n".join(f"  - {line}" for line in report)
+                f"[NEEDS_REVIEW] 批次末尾 concept/entity 覆盖验证失败：\n" +
+                "\n".join(f"  - {line}" for line in report) +
                 f"\n\n请补充对应词条后重新执行 --finalize，或使用 --force 跳过验证。"
             )
     else:
