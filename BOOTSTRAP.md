@@ -1087,6 +1087,10 @@ def _load_log_index() -> Dict[str, str]:
 # 候选文件收集
 # ──────────────────────────────────────────────
 
+def _has_source_map_for_raw(raw_rel: str) -> bool:
+    """检查是否有 source_map 的 raw_link 指向该 Raw 文件（比 log_index SHA 更可靠）。"""
+    return len(find_pages_by_raw_source(raw_rel)) > 0
+
 def _collect_candidates_from_args(targets: List[str]) -> List[str]:
     log_index = _load_log_index()
     allowed_dirs = load_allowed_raw_dirs()
@@ -1136,6 +1140,9 @@ def _collect_candidates_from_args(targets: List[str]) -> List[str]:
             if rel in seen:
                 continue
             seen.add(rel)
+            # 已有 source_map 则视为已摄入（比 log_index SHA 更可靠）
+            if _has_source_map_for_raw(rel):
+                continue
             if rel in log_index and sha256_file(f) == log_index[rel]:
                 continue
             result.append(rel)
@@ -1160,6 +1167,9 @@ def _collect_all_pending() -> List[str]:
             if not f.is_file() or f.suffix.lower() not in SUPPORTED_EXTS:
                 continue
             rel = normalize_path_str(f.relative_to(REPO_ROOT).as_posix())
+            # 已有 source_map 则视为已摄入（比 log_index SHA 更可靠）
+            if _has_source_map_for_raw(rel):
+                continue
             if rel not in log_index or sha256_file(f) != log_index[rel]:
                 result.append(rel)
     return result
