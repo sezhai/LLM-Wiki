@@ -1040,25 +1040,36 @@ def _series_grp(name: str) -> str:
         return m.group(1)
     return rest
 
+def _extract_vol(name: str) -> int:
+    """从文件名提取卷号数字，优先取卷/附录/前言等结构化标记，其次取首段数字。"""
+    # 前言固定卷号 0
+    if '前言' in name:
+        return 0
+    # 附录固定卷号 999
+    if '附录' in name:
+        return 999
+    # 中文数字卷标：卷五/第十二卷/卷十二等
+    m = re.search(r'[卷第]([' + ''.join(_CHN_DIGIT) + '十百千]+)', name)
+    if m:
+        return _chn_num_to_int(m.group(1))
+    # 中文数字+顿号：一二、四五等
+    m = re.search(r'([' + ''.join(_CHN_DIGIT) + '十百千]+)、', name)
+    if m:
+        return _chn_num_to_int(m.group(1))
+    # 阿拉伯数字前缀
+    m = re.match(r'.*?(\d+)', name)
+    if m:
+        return int(m.group(1))
+    # 无编号者排最后
+    return 9999
+
 def _candidate_sort_key(f: Path) -> tuple:
     name = f.stem
     if name.startswith('Sliced_'):
         name = name[7:]
     series = _series_grp(name)
-    if '前言' in name:
-        return (series, 0, '')
-    m = re.search(r'([' + ''.join(_CHN_DIGIT) + '十百千]+)、', name)
-    if m:
-        vol = _chn_num_to_int(m.group(1))
-        return (series, 1, f'{vol:04d}{name}')
-    m = re.search(r'卷[第第]?([' + ''.join(_CHN_DIGIT) + '十百千]+)', name)
-    if m:
-        vol = _chn_num_to_int(m.group(1))
-        return (series, 1, f'{vol:04d}{name}')
-    m = re.match(r'(\d+)', name)
-    if m:
-        return (series, 2, f'{int(m.group(1)):04d}{name}')
-    return (series, 3, name)
+    vol = _extract_vol(name)
+    return (series, vol, name)
 
 # ──────────────────────────────────────────────
 # 日志索引（哈希去重基础）
@@ -1129,6 +1140,7 @@ def _collect_candidates_from_args(targets: List[str]) -> List[str]:
                 continue
             result.append(rel)
 
+    result.sort(key=lambda rel: _candidate_sort_key(REPO_ROOT / rel))
     return result
 
 def _collect_all_pending() -> List[str]:
