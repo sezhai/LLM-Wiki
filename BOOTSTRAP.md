@@ -3446,7 +3446,7 @@ last_updated: YYYY-MM-DD
 title: "<书名 / 长文标题>"
 type: source_map
 author: ""
-raw_link: ""
+raw_link: "[[]]"  # 必须使用 [[Raw/...]] 维基链接格式，check_slug_conflict 据此验证来源归属
 last_updated: YYYY-MM-DD
 pending_review: false
 ---
@@ -3695,5 +3695,5 @@ chore 协议：
 - （设计边界） lint 的加注缺失检查已针对所有来源目录全量检查；仍存在语义误判的可能，Agent 在词条写入时应人工确保加注合规。
 - （操作提示） `query --apply` 时强烈建议提供原始问题文本，防止 pending 文件丢失导致综述标题降级。若遇到已存在综述，需显式追加 `--update`。
 - （设计简化） LLM 推理完全依赖外部 Agent 捕获 `[AGENT_LLM_REQUEST]` 块并回传结果；非 Agent 环境暂不支持。
-- （设计边界） `.llm-wiki/ingest-queue.json` 被 .gitignore 屏蔽，health 检查依赖该文件检测未完成批次。在全新克隆的仓库上该文件不存在，health 会安静通过——这是正确行为。但若用户手动取消 `.gitignore` 或跨机器复制仓库，请注意该文件为本地会话状态，不应入库。
+- （操作提示） `glob` 工具在 Windows 上不支持中文通配符。搜索含中文的文件时，改用 bash + Get-ChildItem：`[Console]::OutputEncoding = [Text.UTF8Encoding]::UTF8; Get-ChildItem -Recurse -Filter "*中文*"`
 ```
