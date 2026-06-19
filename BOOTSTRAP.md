@@ -454,7 +454,7 @@ def parse_ingest_records(log_text: str) -> List[Tuple[str, str, str, str]]:
     return [(m.group(1), m.group(2), m.group(3), m.group(4)) for m in pattern.finditer(log_text)]
 
 def parse_frontmatter(content: str) -> dict:
-    m = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
+    m = re.match(r"^\s*---\n(.*?)\n---", content, re.DOTALL)
     if not m:
         return {}
     try:
