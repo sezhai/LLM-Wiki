@@ -2067,7 +2067,7 @@ def check_missing_entities(link_graph: dict) -> list:
     issues = []
     for stem, count in link_count.items():
         if count >= 3 and stem not in existing_entities:
-            issues.append(f"缺失实体页: [[{stem}]] 被 {count} 个页面引用但无独立词条")
+            issues.append(f"断链: [[{stem}]] 被 {count} 个页面引用但无独立词条")
     return issues
 def check_sparse_pages(link_graph: dict) -> list:
     issues = []
@@ -2285,7 +2285,7 @@ def run_lint(save: bool = False,
     checks = {
         "孤儿页": check_orphan_pages(link_graph),
         "过时综述": check_stale_syntheses(),
-        "缺失实体页": check_missing_entities(link_graph),
+        "断链/缺失词条": check_missing_entities(link_graph),
         "稀疏页": check_sparse_pages(link_graph),
         "Slug冲突": check_slug_conflicts(),
         "图谱感知": check_graph_health(),
