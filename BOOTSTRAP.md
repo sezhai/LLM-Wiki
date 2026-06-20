@@ -370,20 +370,24 @@ MARKITDOWN_AVAILABLE: bool = _check_cli("markitdown")
 
 def _run_qmd(args: List[str], **kwargs):
     """运行 qmd 命令，自动处理 Windows 包装脚本（.cmd/.ps1）的兼容性。"""
-    use_shell = sys.platform == "win32"
-    return _sp.run(["qmd"] + args, shell=use_shell, **kwargs)
+    exe = shutil.which("qmd") or "qmd"
+    return _sp.run([exe] + args, shell=False, **kwargs)
+
 
 def normalize_path_str(s: str) -> str:
     return unicodedata.normalize("NFC", Path(s).as_posix())
 
+
 def is_raw_path(p: str) -> bool:
     return normalize_path_str(p).lower().startswith("raw/")
+
 
 def read_file(path: Path) -> str:
     p = Path(path)
     if not p.exists():
         return ""
     return p.read_text(encoding="utf-8", errors="replace")
+
 
 def write_file(path: Path, content: str) -> None:
     p = Path(path)
@@ -417,6 +421,7 @@ def sha256_file(path, truncate=32):
 def _content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
+
 def read_cached_llm_result(cache_path: Path, current_hash: str) -> Optional[str]:
     """读取以 `# sha256:<hash>` 为头的 LLM 缓存结果。hash 匹配时返回正文，否则返回 None。"""
     if not cache_path.exists():
@@ -426,6 +431,7 @@ def read_cached_llm_result(cache_path: Path, current_hash: str) -> Optional[str]
     if m and m.group(1) == current_hash:
         return re.sub(r"^# sha256:.*\n", "", content).strip()
     return None
+
 
 def write_cached_llm_result(cache_path: Path, result_hash: str, result_text: str) -> None:
     """写入带 sha256 头的 LLM 缓存结果。"""
@@ -447,6 +453,7 @@ def extract_wikilinks(text: str) -> List[str]:
     raw = re.findall(r"\[\[([^\]]+)\]\]", text)
     targets = [item.split("|")[0].strip() for item in raw]
     return list(dict.fromkeys(targets))
+
 
 def resolve_wikilink(name: str, title_alias_map: Optional[Dict[str, Path]] = None) -> Optional[Path]:
     clean = unicodedata.normalize("NFC", name.rstrip("/"))
@@ -470,6 +477,7 @@ def resolve_wikilink(name: str, title_alias_map: Optional[Dict[str, Path]] = Non
             return title_alias_map[key]
     return None
 
+
 def build_title_alias_map() -> Dict[str, Path]:
     """构建 {title/别名: 页面路径} 字典，用于 wikilink 解析的 title/alias 回退。"""
     mapping: Dict[str, Path] = {}
@@ -488,6 +496,7 @@ def build_title_alias_map() -> Dict[str, Path]:
                     mapping[alias] = page
     return mapping
 
+
 def load_allowed_raw_dirs() -> List[Dict]:
     if not RAW_MAPPING.exists():
         raise FileNotFoundError(
@@ -502,6 +511,7 @@ def load_allowed_raw_dirs() -> List[Dict]:
         )
     return dirs
 
+
 def load_domain_enum() -> List[str]:
     if not DOMAIN_ENUM_FILE.exists():
         return []
@@ -510,6 +520,7 @@ def load_domain_enum() -> List[str]:
         return data.get("domains", [])
     except Exception:
         return []
+
 
 def init_env() -> None:
     """Initialize environment for graph building (no-op in current setup)."""
@@ -529,6 +540,7 @@ def parse_ingest_records(log_text: str) -> List[Tuple[str, str, str, str]]:
     )
     return [(m.group(1), m.group(2), m.group(3), m.group(4).strip()) for m in pattern.finditer(log_text)]
 
+
 def parse_frontmatter(content: str) -> dict:
     m = re.match(r"^\s*---\n(.*?)\n---", content, re.DOTALL)
     if not m:
@@ -537,6 +549,7 @@ def parse_frontmatter(content: str) -> dict:
         return yaml.safe_load(m.group(1)) or {}
     except Exception:
         return {}
+
 
 def _clean_wikilink_str(raw: str) -> str:
     """
@@ -547,6 +560,7 @@ def _clean_wikilink_str(raw: str) -> str:
     s = raw.strip().strip('"').strip("'").strip()
     m = re.match(r"^\[\[(.+)\]\]$", s)
     return m.group(1).strip() if m else s
+
 
 def _extract_raw_sources_from_frontmatter(fm: dict) -> Set[str]:
     """
@@ -596,6 +610,7 @@ def _extract_raw_sources_from_frontmatter(fm: dict) -> Set[str]:
         return raw_paths
 
     return raw_paths
+
 
 def check_slug_conflict(
     slug: str,
@@ -665,6 +680,7 @@ def check_slug_conflict(
 
     return False, None
 
+
 def parse_log_slugs(log_text: str) -> Dict[str, str]:
     result: Dict[str, str] = {}
     for _, _, _, slug in parse_ingest_records(log_text):
@@ -674,6 +690,7 @@ def parse_log_slugs(log_text: str) -> Dict[str, str]:
         result[m.group(1).strip()] = "query-synthesis"
     return result
 
+
 def list_pending_review() -> List[Path]:
     result = []
     for page in all_wiki_pages():
@@ -681,6 +698,7 @@ def list_pending_review() -> List[Path]:
         if re.search(r"^pending_review:\s*true\s*$", content, re.MULTILINE):
             result.append(page)
     return result
+
 
 def find_pages_by_raw_source(raw_rel: str) -> List[Path]:
     """返回所有 frontmatter 中引用指定 raw_rel 的 wiki 页面。"""
@@ -753,9 +771,11 @@ def build_raw_source_index() -> Dict[str, List[Path]]:
 
     return index
 
+
 def find_pages_by_raw_source_indexed(raw_rel: str, index: Dict[str, List[Path]]) -> List[Path]:
     """使用预构建索引的查询版本。"""
     return index.get(normalize_path_str(raw_rel), [])
+
 
 def parse_moved_paths(log_text: str) -> Dict[str, str]:
     """解析 move 记录，直接按日志追加的自然顺序处理。"""
@@ -773,6 +793,7 @@ def parse_moved_paths(log_text: str) -> Dict[str, str]:
         origin_of[new_path] = origin
     return moves
 
+
 def load_graph_json() -> Optional[dict]:
     graph_file = GRAPH_DIR / "graph.json"
     if not graph_file.exists():
@@ -781,6 +802,7 @@ def load_graph_json() -> Optional[dict]:
         return json.loads(graph_file.read_text(encoding="utf-8"))
     except Exception:
         return None
+
 
 def agent_llm(prompt: str, output_var: str = "LLM_OUTPUT") -> str:
     request_id = str(uuid.uuid4())[:8]
@@ -791,6 +813,7 @@ def agent_llm(prompt: str, output_var: str = "LLM_OUTPUT") -> str:
     print(f"[/AGENT_LLM_REQUEST:{request_id}]")
     print(f"请基于上述提示完成推理，并将结果作为 {output_var} 变量输出。\n")
     return "[AGENT_PENDING]"
+
 
 def qmd_embed_wiki() -> None:
     if QMD_AVAILABLE:
@@ -853,6 +876,7 @@ def check_empty_pages(pages: Dict[str, Path]) -> List[str]:
         if not body:
             issues.append(f"空文件/存根页: {rel}")
     return issues
+
 def check_index_sync(pages: Dict[str, Path]) -> List[str]:
     issues = []
     if not INDEX_FILE.exists():
@@ -876,6 +900,7 @@ def check_index_sync(pages: Dict[str, Path]) -> List[str]:
     for rel in index_pages - disk_pages:
         issues.append(f"index.md 收录但磁盘不存在: {rel}")
     return issues
+
 def check_log_coverage(pages: Dict[str, Path]) -> List[str]:
     issues = []
     if not LOG_FILE.exists():
@@ -905,6 +930,7 @@ def check_log_coverage(pages: Dict[str, Path]) -> List[str]:
         elif subdir == "syntheses" and not slug_map[stem].startswith("query-synthesis"):
             issues.append(f"综述页未经正规 query-synthesis 流程登记（当前类型: {slug_map[stem]}）: {rel}")
     return issues
+
 def check_overview_placeholder() -> List[str]:
     issues = []
     if not OVERVIEW_FILE.exists():
@@ -927,6 +953,7 @@ def check_overview_placeholder() -> List[str]:
         if not body_clean:
             issues.append(f'overview.md 的"{sec_title}"节仍为占位内容，请 Agent 更新')
     return issues
+
 def check_broken_links(pages: Dict[str, Path]) -> List[str]:
     issues = []
     title_alias_map = build_title_alias_map()
@@ -943,6 +970,7 @@ def check_broken_links(pages: Dict[str, Path]) -> List[str]:
             if resolved is None:
                 issues.append(f"断链: {rel} -> [[{link}]]")
     return issues
+
 def _get_asset_dir_names() -> List[str]:
     """read annotation=null dirs from raw-mapping.json"""
     try:
@@ -952,22 +980,38 @@ def _get_asset_dir_names() -> List[str]:
     except Exception:
         return ["Assets"]
 
+
+
+def _get_asset_dir_names() -> List[str]:
+    """从 raw-mapping.json 读取 annotation 为 null 的目录名（asset 目录）"""
+    try:
+        allowed = load_allowed_raw_dirs()
+        names = [d["name"] for d in allowed if d.get("annotation") is None]
+        return names if names else ["Assets"]
+    except Exception:
+        return ["Assets"]
+
+
 def check_assets_links(pages: Dict[str, Path]) -> List[str]:
     issues = []
     asset_dirs = _get_asset_dir_names()
     for rel, p in pages.items():
         content = read_file(p)
         for ad in asset_dirs:
+            ad_re = re.escape(ad)
             asset_refs = re.findall(
-                r"!\[[^\]]*\]\(" + "Raw/" + ad + r"/[^\)]+\)|!\[\[([^\]]*Raw/" + ad + r"/[^\]]*)\]\]",
+                r"!\[[^\]]*\]\((" + "Raw/" + ad_re + r"/[^\)]+)\)"
+                r"|!\[\[([^\]]*Raw/" + ad_re + r"/[^\]]*)\]\]",
                 content
             )
             for g1, g2 in asset_refs:
                 ref = g1 or g2
                 asset_path = REPO_ROOT / ref
                 if not asset_path.exists():
-                    issues.append(f"Assets broken link: {rel} -> {ref}")
-    return issuesdef check_raw_dir_compliance() -> List[str]:
+                    issues.append(f"Assets \u65ad\u94fe: {rel} -> {ref}")
+    return issues
+
+def check_raw_dir_compliance() -> List[str]:
     issues = []
     if not RAW_DIR.exists():
         return ["Raw/ 目录不存在"]
@@ -982,6 +1026,7 @@ def check_assets_links(pages: Dict[str, Path]) -> List[str]:
         if item.name not in allowed:
             issues.append(f"Raw 目录合规警告: Raw/{item.name} 不在允许列表中")
     return issues
+
 def check_hash_consistency() -> List[str]:
     issues = []
     if not LOG_FILE.exists():
@@ -1030,9 +1075,11 @@ def check_hash_consistency() -> List[str]:
                     f"请确认是否需要重新摄入（若为手动编辑后的文件，重新执行 ingest 即可更新哈希基准）"
                 )
     return issues
+
 def check_pending_review() -> List[str]:
     pending = list_pending_review()
     return [f"待裁决: {p.relative_to(REPO_ROOT).as_posix()}" for p in pending]
+
 def check_domain_compliance(pages: Dict[str, Path]) -> List[str]:
     issues = []
     allowed = load_domain_enum()
@@ -1051,6 +1098,7 @@ def check_domain_compliance(pages: Dict[str, Path]) -> List[str]:
         if isinstance(domain_val, str) and domain_val not in allowed:
             issues.append(f"domain 值非法: {rel}（值：{domain_val}，合法枚举：{', '.join(allowed)}）")
     return issues
+
 def check_frontmatter_parse(pages: Dict[str, Path]) -> List[str]:
     """检查所有页面是否包含可解析的 frontmatter 块，若存在但解析失败则报 WARN。"""
     issues = []
@@ -1075,6 +1123,7 @@ def check_frontmatter_parse(pages: Dict[str, Path]) -> List[str]:
                     f"疑似某项漏写引号，应为 [\"[[Raw/...]]\"]）"
                 )
     return issues
+
 def check_qmd_collections() -> List[str]:
     issues = []
     if not QMD_AVAILABLE:
@@ -1097,6 +1146,7 @@ def check_qmd_collections() -> List[str]:
     except Exception as e:
         issues.append(f"qmd 集合检查异常: {e}")
     return issues
+
 def check_ingest_queue_residual() -> List[str]:
     issues = []
     if INGEST_QUEUE_FILE.exists():
@@ -1111,6 +1161,7 @@ def check_ingest_queue_residual() -> List[str]:
         except Exception:
             issues.append("ingest-queue.json 文件损坏，建议手动删除 .llm-wiki/ingest-queue.json 重置。")
     return issues
+
 def run_health(save: bool = False, as_json: bool = False) -> int:
     pages = _all_wiki_pages_relative()
     results = {
@@ -1231,9 +1282,6 @@ def _load_log_index() -> Dict[str, str]:
 # ──────────────────────────────────────────────
 # 候选文件收集
 # ──────────────────────────────────────────────
-def _has_source_map_for_raw(raw_rel: str) -> bool:
-    """检查是否有 source_map 的 raw_link 指向该 Raw 文件（比 log_index SHA 更可靠）。"""
-    return len(find_pages_by_raw_source(raw_rel)) > 0
 # ── Bug 5 修复：_collect_candidates_from_args 使用预构建索引 ──
 def _collect_candidates_from_args(targets: List[str]) -> List[str]:
     log_index = _load_log_index()
@@ -1294,11 +1342,13 @@ def _read_queue() -> Optional[dict]:
         return json.loads(read_file(INGEST_QUEUE_FILE))
     except Exception:
         return None
+
 def _write_queue(data: dict) -> None:
     write_file(INGEST_QUEUE_FILE, json.dumps(data, ensure_ascii=False, indent=2))
 def _queue_has_pending() -> bool:
     q = _read_queue()
     return bool(q and q.get("pending"))
+
 def scan_and_build_queue(candidates: List[str], mode: str = "normal") -> Optional[str]:
     """
     建立或恢复批次队列。mode 参数记录触发模式（"normal" 或 "discuss"），
@@ -1355,6 +1405,7 @@ def scan_and_build_queue(candidates: List[str], mode: str = "normal") -> Optiona
     if remaining_candidates:
         print(f"\n提示：本批次（{len(batch)} 个）处理完后将自动继续下一批。剩余 {len(remaining_candidates)} 个文件。")
     return batch[0]
+
 def _run_batch_end_validation(queue_data: dict, force: bool = False) -> Tuple[bool, List[str], List[str]]:
     """返回 (是否阻断, 人类可读报告, 缺失覆盖的 raw_rel 列表)"""
     if force:
@@ -1362,6 +1413,7 @@ def _run_batch_end_validation(queue_data: dict, force: bool = False) -> Tuple[bo
     done = queue_data.get("done", [])
     no_concept_slugs = queue_data.get("no_concept_slugs", [])
     return _check_concept_coverage(done, no_concept_slugs)
+
 def _print_queue_status(remaining: int, queue_mode: str) -> None:
     """输出队列状态信号（避免 _advance_queue 和 _skip_and_advance 重复代码）。"""
     if remaining == 0:
@@ -1452,6 +1504,7 @@ def _advance_queue(raw_rel: str, subdir: str = "", slug: str = "",
         f"重新执行 --finalize（或使用 --force 跳过验证）。"
     )
     return EXIT_NEEDS_REVIEW
+
 def _check_concept_coverage(done_rels: List[str], no_concept_slugs: List[str]) -> Tuple[bool, List[str], List[str]]:
     """
     返回 (是否阻断, 人类可读报告, 缺失覆盖的 raw_rel 列表)。
@@ -1510,6 +1563,7 @@ def _check_concept_coverage(done_rels: List[str], no_concept_slugs: List[str]) -
     ]
     return bool(missing_raws), missing_report, missing_raws
 
+
 def _check_batch_broken_links(queue_data: dict) -> List[Tuple[str, str]]:
     """检查本批次所有相关词条中的断链（title/alias 回退已内置）。
     返回 [(来源页rel, wikilink目标), ...] 列表，空列表表示无断链。
@@ -1559,6 +1613,7 @@ def _check_batch_broken_links(queue_data: dict) -> List[Tuple[str, str]]:
             if resolved is None:
                 issues.append((page_rel, link))
     return issues
+
 
 def _finalize_batch(queue_data: dict) -> None:
     done = queue_data.get("done", [])
@@ -1660,6 +1715,7 @@ def _convert_to_markdown(file_path: Path) -> Tuple[bool, str]:
     except Exception as e:
         print(f"WARN: markitdown 转换异常: {file_path.name}: {e}")
         return False, ""
+
 def _get_annotation(file_path: Path) -> str:
     try:
         allowed = load_allowed_raw_dirs()
@@ -1670,6 +1726,7 @@ def _get_annotation(file_path: Path) -> str:
     except Exception:
         pass
     return ""
+
 def _write_error_log(operation: str, reason: str) -> None:
     today = date.today().isoformat()
     append_log(f"## [{today}] ERROR | {operation} | {reason}")
@@ -1772,6 +1829,7 @@ def run_skip(raw_rel: str, force: bool = False) -> int:
     print(f"INFO: 已跳过 {normalized}")
     _skip_and_advance(normalized, reason="用户主动跳过", force=force)
     return 0
+
 def _update_index(slug: str, subdir: str, title: str, brief: str = "") -> None:
     if not INDEX_FILE.exists():
         return
@@ -2091,6 +2149,7 @@ def _get_last_ingest_date(raw_rel: str) -> str:
     log_text = read_file(LOG_FILE)
     dates = [d for d, rel, _, _ in parse_ingest_records(log_text) if rel == raw_rel]
     return max(dates) if dates else ""
+
 def _build_link_graph() -> dict:
     """一次性扫描所有 wiki 页面，返回 {page_path_str: {"links": [...], "content": str}}。"""
     graph = {}
@@ -2102,6 +2161,7 @@ def _build_link_graph() -> dict:
             "links": extract_wikilinks(content),
         }
     return graph
+
 def check_orphan_pages(link_graph: dict) -> list:
     inbound: set = set()
     excluded_stems = {"index", "log", "overview"}
@@ -2123,6 +2183,7 @@ def check_orphan_pages(link_graph: dict) -> list:
         if str(page.resolve()) not in inbound:
             issues.append(f"孤儿页: {page.relative_to(REPO_ROOT).as_posix()}")
     return issues
+
 def check_stale_syntheses() -> list:
     issues = []
     syntheses_dir = WIKI_DIR / "syntheses"
@@ -2164,6 +2225,7 @@ def check_stale_syntheses() -> list:
                 )
                 break
     return issues
+
 def check_missing_entities(link_graph: dict) -> list:
     link_count: dict = {}
     entities_dir = WIKI_DIR / "entities"
@@ -2183,6 +2245,7 @@ def check_missing_entities(link_graph: dict) -> list:
         if count >= 3 and stem not in existing_entities:
             issues.append(f"断链: [[{stem}]] 被 {count} 个页面引用但无独立词条")
     return issues
+
 def check_sparse_pages(link_graph: dict) -> list:
     issues = []
     excluded_stems = {"index", "log", "overview"}
@@ -2280,6 +2343,7 @@ def check_annotation_missing(pages_with_sources: list,
         ), True
     write_cached_llm_result(ANNOTATION_RESULT_FILE, entries_hash, result)
     return f"加注缺失检查结果：\n{result}", False
+
 def check_slug_conflicts() -> list:
     """检查日志中同一 slug 对应多个不同 Raw 源文件的冲突，使用 move 归一化避免假阳性。"""
     if not LOG_FILE.exists():
@@ -2297,6 +2361,7 @@ def check_slug_conflicts() -> list:
         for s, raws in slug_to_raws.items() if len(raws) > 1
     ]
     return conflicts
+
 def check_blind_spots(apply_answer_file: str = "", apply_answer_text: str = "") -> Tuple[str, bool]:
     if not INDEX_FILE.exists():
         return "知识盲区：index.md 不存在，跳过分析。", False
@@ -2331,6 +2396,7 @@ def check_blind_spots(apply_answer_file: str = "", apply_answer_text: str = "") 
         ), True
     write_cached_llm_result(BLIND_SPOT_RESULT_FILE, current_hash, result)
     return f"知识盲区推荐：\n{result}", False
+
 def check_graph_health() -> list:
     graph_data = load_graph_json()
     if not graph_data:
@@ -2371,6 +2437,7 @@ def check_graph_health() -> list:
             f"冲突边密度过高: contradicts 边占比 {len(contradicts)/len(edges):.1%}（> 15%）"
         )
     return issues
+
 def run_lint(save: bool = False,
              apply_annotation_check: str = "",
              apply_annotation_text: str = "",
@@ -2550,8 +2617,10 @@ def _search_wiki_index(keywords: list) -> list:
         all_hits = list(hits) + [h for h in neighbor_hits if h not in hits]
         return all_hits[:MAX_WIKI_HITS]
     return list(hits)[:MAX_WIKI_HITS]
+
 def _strip_qmd_prefix(path: str) -> str:
     return re.sub(r"^qmd://[^/]+/", "", path)
+
 def _search_qmd(question: str, collection: str = "wiki", n: int = 8) -> list:
     if not QMD_AVAILABLE:
         return []
@@ -2576,6 +2645,7 @@ def _search_qmd(question: str, collection: str = "wiki", n: int = 8) -> list:
     except Exception:
         pass
     return []
+
 def _save_synthesis(question: str, answer: str, slug: str,
                     source_hits: Optional[List[str]] = None,
                     update: bool = False) -> int:
@@ -2677,6 +2747,7 @@ def _save_synthesis(question: str, answer: str, slug: str,
     qmd_embed_wiki()
     print(f"OK: 已归档至 Wiki/syntheses/{slug}.md")
     return 0
+
 def run_query(question: str, save: bool = False, slug: str = "",
               apply_answer: str = "",
               qmd_hits_file: str = "",
@@ -2918,10 +2989,13 @@ EDGE_COLORS = {"EXTRACTED": "#555555", "INFERRED": "#FF5722", "AMBIGUOUS": "#BDB
 COMMUNITY_COLORS = ["#E91E63", "#00BCD4", "#8BC34A", "#FF5722", "#673AB7", "#FFC107", "#009688", "#F44336", "#3F51B5", "#CDDC39"]
 
 def sha256(text: str) -> str: return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
 def extract_frontmatter_type(content: str) -> str:
     m = re.search(r'^type:\s*(\S+)', content, re.MULTILINE)
     return m.group(1).strip('"\'') if m else "unknown"
+
 def page_id(path: Path) -> str: return path.relative_to(WIKI_DIR).as_posix().replace(".md", "")
+
 def edge_id(src: str, target: str, type_: str) -> str: return f"{src}->{target}:{type_}"
 
 def load_cache() -> dict:
@@ -2948,6 +3022,7 @@ def build_nodes(pages: list[Path]) -> list[dict]:
             "markdown": content # 保留 Markdown 用于侧边栏渲染，移除了 title 属性
         })
     return nodes
+
 
 def build_extracted_edges(pages: list[Path]) -> list[dict]:
     stem_map = {p.stem.lower(): page_id(p) for p in pages}
@@ -2977,6 +3052,7 @@ def build_extracted_edges(pages: list[Path]) -> list[dict]:
                     "color": EDGE_COLORS["EXTRACTED"], "confidence": 1.0
                 })
     return edges
+
 
 def build_inferred_edges(pages: list[Path], cache: dict, resume: bool = True) -> tuple[list[dict], bool]:
     edges, completed = [], set()
@@ -3062,6 +3138,7 @@ def build_inferred_edges(pages: list[Path], cache: dict, resume: bool = True) ->
 
     return edges, True
 
+
 def deduplicate_edges(edges: list[dict]) -> list[dict]:
     best = {}
     for e in edges:
@@ -3073,6 +3150,7 @@ def deduplicate_edges(edges: list[dict]) -> list[dict]:
         edge.setdefault("color", EDGE_COLORS.get(rel_type, EDGE_COLORS["INFERRED"]))
         edge.setdefault("confidence", 0.7 if rel_type != "EXTRACTED" else 1.0)
     return list(best.values())
+
 
 def generate_report(nodes: list[dict], edges: list[dict], communities: dict[str, int], pages: list[Path]) -> str:
     if not nodes: return "Wiki is empty."
@@ -3111,6 +3189,7 @@ def generate_report(nodes: list[dict], edges: list[dict], communities: dict[str,
         lines.append(f"- **Contradictions ({len(contradicts)}):** {contradict_parts}")
         
     return "\n".join(lines)
+
 
 def build_graph(infer: bool = True, open_browser: bool = False, clean: bool = False,
                 report: bool = False, save: bool = False, apply_inferred: bool = False):
