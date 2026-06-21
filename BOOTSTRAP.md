@@ -1,5 +1,7 @@
 # LLM Wiki 仓库创建提示词
 
+**目标环境**：Windows PowerShell 7+
+
 **本文件用途**：将本文件复制到任意空白目录，交给一个具备文件系统与 Shell 工具的 AI Agent（如 Claude Code、Cursor、OpenCode 等）。  
 
 Agent 阅读本文件后，将在该目录中完整创建一个符合 LLM Wiki 规范的知识操作系统骨架，所有工具脚本在 bootstrap 阶段一次性写入。  
@@ -86,7 +88,7 @@ Get-ChildItem -LiteralPath "."
 
 ### 1.3 创建物理目录结构
 
-用 `mkdir -p` 一次性创建所有目录。关键约束：
+用 `New-Item -ItemType Directory -Force` 一次性创建所有目录（PowerShell / bash 通用：`mkdir -Force` 或 `mkdir -p` 均可，Agent 按实际 Shell 选择）。关键约束：
 - `Wiki/` 下必须创建五个平铺子目录（禁止再建子文件夹）：`concepts/`、`entities/`、`sources/`、`syntheses/`、`disambiguations/`
 - `Raw/` 仅预建 §1.1 确认的子目录；加注映射以 Raw 根下第一级子目录为准
 - `.llm-wiki/` 在此创建，JSON 配置文件在 §1.4 写入
@@ -184,7 +186,6 @@ pending_review: false
 .rag/
 .vsearch/
 # qmd 查询临时命中文件
-.qmd-hits.json
 # Python 缓存
 __pycache__/
 *.pyc
@@ -203,7 +204,6 @@ workspace.json
 # 反向索引缓存（mtime 自动生成，每机不同）
 .llm-wiki/source-index-cache.json
 *.tmp
-.qmd-pending-query.json
 # 摄入批次清单（运行时临时状态，不入库）
 .llm-wiki/ingest-queue.json
 # OS 文件
@@ -232,7 +232,7 @@ pip install -r Tools/requirements.txt
 安装完成后执行 smoke test 验证 markitdown：
 
 ```bash
-python -c "import markitdown; print('markitdown', markitdown.__version__)"
+python -c "import markitdown; v = getattr(markitdown, '__version__', 'unknown'); print('markitdown', v); md = markitdown.MarkItDown(); assert md is not None"
 ```
 
 若安装失败，将错误信息输出给用户，**标记此步骤为阻塞状态**，并停止 bootstrap 流程。告知用户手动解决 pip 依赖问题后，重新执行本步骤及后续步骤即可继续（清单机制会记住未完成项）。
@@ -313,7 +313,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 import yaml
 
-if sys.stdout.encoding.lower() != 'utf-8':
+if not getattr(sys.stdout, 'encoding', None) or sys.stdout.encoding.lower() != 'utf-8':
     import io
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
 
@@ -358,7 +358,7 @@ PYTHON_BIN: str = sys.executable
 EXIT_OK = 0
 EXIT_BLOCKED = 1       # 结构性问题，需要人工/Agent 修复后重跑
 EXIT_LLM_PENDING = 2   # 依赖 agent_llm 异步推理结果，需回传后重跑
-EXIT_NEEDS_REVIEW = 3  # ingest/query: slug conflict, concept coverage failure 专用：slug 冲突或 concept/entity 覆盖验证失败，需人工处理后重跑
+EXIT_NEEDS_REVIEW = 3  # 需人工介入（slug 冲突或 concept/entity 覆盖缺失）
 
 # ── 优化：使用 shutil.which 进行轻量级跨平台 CLI 探测 ──
 def _check_cli(cmd: str) -> bool:
@@ -527,8 +527,8 @@ def init_env() -> None:
     pass
 
 def ensure_utf8() -> None:
-    """Ensure stdout uses UTF-8 encoding."""
-    if sys.stdout.encoding.lower() != 'utf-8':
+    """Ensure stdout uses UTF-8 encoding (also done at module level; kept for re-entry safety)."""
+    if not getattr(sys.stdout, 'encoding', None) or sys.stdout.encoding.lower() != 'utf-8':
         import io
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
 
@@ -972,17 +972,6 @@ def check_broken_links(pages: Dict[str, Path]) -> List[str]:
     return issues
 
 def _get_asset_dir_names() -> List[str]:
-    """read annotation=null dirs from raw-mapping.json"""
-    try:
-        allowed = load_allowed_raw_dirs()
-        names = [d["name"] for d in allowed if d.get("annotation") is None]
-        return names if names else ["Assets"]
-    except Exception:
-        return ["Assets"]
-
-
-
-def _get_asset_dir_names() -> List[str]:
     """从 raw-mapping.json 读取 annotation 为 null 的目录名（asset 目录）"""
     try:
         allowed = load_allowed_raw_dirs()
@@ -1269,6 +1258,7 @@ def _natural_key(s: str) -> tuple:
     def convert(chunk: str):
         return int(chunk) if chunk.isdigit() else chunk.lower()
     return tuple(convert(chunk) for chunk in re.split(r'(\d+)', s))
+
 # ──────────────────────────────────────────────
 # 日志索引（哈希去重基础）
 # ──────────────────────────────────────────────
@@ -1310,7 +1300,9 @@ def _collect_candidates_from_args(targets: List[str]) -> List[str]:
             continue
         for f in files:
             # 硬性前置条件：候选文件必须位于 Raw/ 下
-            if not f.is_relative_to(RAW_DIR):
+            try:
+                f.relative_to(RAW_DIR)
+            except ValueError:
                 print(f"WARN: {f} 不在 Raw/ 目录下，跳过（仅支持 Raw/ 下的文件）。")
                 continue
             try:
@@ -1960,7 +1952,7 @@ def run_finalize(slug: str, title: str, raw_rel: str, brief: str = "",
         normalized_rel, subdir=subdir, slug=slug, title=title,
         force=force, no_concept=no_concept,
     )
-    if no_concept and result != EXIT_NEEDS_REVIEW:
+    if no_concept:
         if LOG_FILE.exists():
             existing_log = read_file(LOG_FILE)
             marker = f"no-concept | [[{normalized_rel}]]"
@@ -1975,7 +1967,7 @@ def run_finalize(slug: str, title: str, raw_rel: str, brief: str = "",
 # ──────────────────────────────────────────────
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="LLM Wiki 摄入工具 v2.6",
+        description="LLM Wiki 摄入工具 v1.0",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 三种模式，批处理和讨论模式超过 DEFAULT_BATCH_SIZE 个文件均自动截断为一批：
@@ -2431,7 +2423,7 @@ def check_graph_health() -> list:
                 page = resolve_wikilink(n["id"])
                 if page and len(read_file(page)) < 500:
                     issues.append(f"枢纽存根: {n['id']}（高度数但内容 < 500 字）")
-    contradicts = [e for e in edges if e.get("relation") == "contradicts"]
+    contradicts = [e for e in edges if e.get("relation") == "contradicts" or e.get("relationship") == "contradicts"]
     if edges and len(contradicts) / len(edges) > 0.15:
         issues.append(
             f"冲突边密度过高: contradicts 边占比 {len(contradicts)/len(edges):.1%}（> 15%）"
@@ -3143,7 +3135,9 @@ def deduplicate_edges(edges: list[dict]) -> list[dict]:
     best = {}
     for e in edges:
         k = (min(e["from"], e["to"]), max(e["from"], e["to"]))
-        if k not in best or e.get("confidence", 0) > best[k].get("confidence", 0): best[k] = e
+        if k not in best or e.get("confidence", 0) > best.get(k, {}).get("confidence", 0):
+            if "relation" not in e and "relation" in best.get(k, {}): e["relation"] = best[k]["relation"]
+            best[k] = e
     for edge in best.values():
         rel_type = edge.get("type", "INFERRED")
         edge.setdefault("id", edge_id(edge["from"], edge["to"], rel_type))
@@ -3183,7 +3177,7 @@ def generate_report(nodes: list[dict], edges: list[dict], communities: dict[str,
         if phantoms:
             lines.append(f"- **Phantom Hubs:** {', '.join(f'`{k}`({c})' for k, c in phantoms[:10])}")
             
-    contradicts = [e for e in edges if e.get("relation") == "contradicts"]
+    contradicts = [e for e in edges if e.get("relation") == "contradicts" or e.get("relationship") == "contradicts"]
     if contradicts:
         contradict_parts = ', '.join('`' + str(e.get('from', '?')) + ' ?? ' + str(e.get('to', '?')) + '`' for e in contradicts[:5])
         lines.append(f"- **Contradictions ({len(contradicts)}):** {contradict_parts}")
@@ -3410,7 +3404,7 @@ AGENTS.md 内部包含完整词条模板（§3.1–§3.5），Agent 创建词条
 
 ```markdown
 # AGENTS.md（最高操作契约）
-<!-- version: v1.0 | created: 2025-06-19 | updated: 2026-06-19 -->
+<!-- version: v1.0 | created: <YYYY-MM-DD> | updated: <YYYY-MM-DD> -->
 本文件是 Agent 每次执行前必读的最高宪法。所有工作流、规则、模板均以本文件为唯一权威来源。
 何时修订：当某条规则反复产生不符合预期的结果，或某个工作流与实际使用习惯持续偏差时，与研究者讨论后修订。
 ## 会话启动规程（每次新会话必须首先执行）
@@ -3724,7 +3718,8 @@ WARN: 争议：
 触发：`health` → `python -m Tools.health [--json] [--save]`
 频率：每次会话启动规程中必跑 | 成本：零 LLM 调用
 检查项：空文件/存根页、索引同步、日志覆盖（区分 ingest 和 query-synthesis 来源）、Overview 占位、断链、Assets 断链、Raw 目录合规、哈希一致性（含 move/delete 追踪，当关联词条已标记 pending_review 时不再重复报告）、pending_review 扫描、Domain 合规、Frontmatter 解析（检测 YAML 语法错误）、qmd 集合初始化状态、摄入批次残留。
-**统一退出码**：`0`=通过，`1`=结构性问题需修复，`2`=挂起需 Agent 推理回传（lint: LLM 推理待回传）\n`3`=需人工介入（ingest/query: slug 冲突或 concept 覆盖缺失）。health/lint 共用此约定，ingest/query 仅复用部分值。非阻塞提示（日志覆盖、Overview 占位等）不改变退出码。
+**统一退出码**：`0`=通过，`1`=结构性问题需修复，`2`=挂起需 Agent 推理回传（lint: LLM 推理待回传）
+`3`=需人工介入（ingest/query: slug 冲突或 concept 覆盖缺失）。health/lint 共用此约定，ingest/query 仅复用部分值。非阻塞提示（日志覆盖、Overview 占位等）不改变退出码。
 ## 八、质量审计工作流（Lint Workflow）
 触发：`lint` → `python -m Tools.lint [--save]`
 频率：每次摄入批次（`[STOP] 批次已全部完成`）后，若本批次摄入了 3 个以上文件，立即运行一次 lint；否则可累积到下次较大批次或研究者显式要求时运行。lint 是幂等的，不确定时直接运行即可。
@@ -3771,7 +3766,12 @@ chore 协议：
 - 摄入队列：`.llm-wiki/ingest-queue.json`
 - 运行报告：`.llm-wiki/tmp/health-report.md`、`.llm-wiki/tmp/lint-report.md`
 - 查询中间文件：`.llm-wiki/tmp/qmd-hits.json`、`.llm-wiki/tmp/qmd-pending-query.json`
+
 ## 十二、已知限制
+
+- 中文卷号排序：_natural_key 仅处理阿拉伯数字。多切片命名规范已统一用 _part1 后缀。
+- 无向边去重：deduplicate_edges 以无向键合并双向边，方向语义不同时只保留 confidence 高者。冲突边统计已通过双字段 or 兜底。
+- no-concept 审计链：批次验证失败触发 requeue 时若同时使用 --no-concept，log.md 不写入该豁免记录。队列状态正确更新，重跑不受影响。
 - （设计边界） lint 的加注缺失检查已针对所有来源目录全量检查；仍存在语义误判的可能，Agent 在词条写入时应人工确保加注合规。
 - （操作提示） `query --apply` 时强烈建议提供原始问题文本，防止 pending 文件丢失导致综述标题降级。若遇到已存在综述，需显式追加 `--update`。
 - （设计简化） LLM 推理完全依赖外部 Agent 捕获 `[AGENT_LLM_REQUEST]` 块并回传结果；非 Agent 环境暂不支持。
